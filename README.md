@@ -12,14 +12,17 @@ K-Startup(창업지원포털)의 **'모집중' 사업공고** 데이터를 실�
 
 ## 🛠️ VSCode 빠른 실행 가이드 (Quick Start)
 
+# Windows
+
 ### 1단계: 가상환경 생성 및 활성화 (권장)
 VSCode 터미널(`Ctrl + ~`)을 열고 아래 명령어를 입력하세요.
 
 ```bash
-# Windows
 python -m venv venv
 venv\Scripts\activate
+pip install -r requirements.txt
 
-# Mac / Linux
-python3 -m venv venv
-source venv/bin/activate
+### 2단계: streamlit run을 이용해 app.py 실행
+
+```bash
+streamlit run .\app.py
