@@ -32,7 +32,6 @@ class StartupPathfinderOrchestrator:
         user_profile: Dict[str, str],
         user_query: str,
         force_refresh_crawl: bool = False,
-        force_mock_crawl: bool = False,
     ) -> Dict[str, Any]:
         react_steps: List[Dict[str, Any]] = []
 
@@ -52,7 +51,7 @@ class StartupPathfinderOrchestrator:
         if force_refresh_crawl or not self.mcp.rag_engine.is_indexed:
             action_1 = {
                 "tool": "mcp_kstartup_crawl_ongoing",
-                "args": {"max_pages": 1, "force_mock": force_mock_crawl},
+                "args": {},
             }
             obs_1 = self.mcp.call_tool(action_1["tool"], action_1["args"])
         else:
@@ -82,7 +81,7 @@ class StartupPathfinderOrchestrator:
         )
 
         evidence_1 = [
-            f"데이터 수집 모드: {obs_1.get('crawl_mode', self.mcp.last_crawl_status)}",
+            f"데이터 로드 상태: {obs_1.get('crawl_mode', self.mcp.last_crawl_status)}",
             f"RAG 인덱싱 공고 수: {doc_count}건 | GraphDB 활성 노드/엣지: {len(self.mcp.graph_engine.nodes)}개 / {len(self.mcp.graph_engine.edges)}개",
             f"지원분야별 공고 분포: {cat_dist}",
             f"매핑된 GraphDB 페르소나: '{mapped_persona}' | 희망분야('{need_category}') 가용 공고: {target_cat_count}건",
@@ -152,7 +151,6 @@ class StartupPathfinderOrchestrator:
         graph_ranked = obs_2_graph.get("ranked_announcements", [])
         graph_map = {g["pbanc_sn"]: g for g in graph_ranked}
 
-        # 후보가 부족할 경우 GraphDB 상위 공고 또는 전체 카테고리 RAG 결과로 자가 교정 보완
         expanded_search_triggered = False
         if len(matched_docs) < 2:
             expanded_search_triggered = True
@@ -172,7 +170,6 @@ class StartupPathfinderOrchestrator:
                     matched_docs.append(bd)
                     seen_sns.add(bd["pbanc_sn"])
 
-        # 각 후보 문서에 GraphDB 택사노미 경로 정보 주입
         evidence_2 = []
         for idx, d in enumerate(matched_docs, 1):
             sn = d["pbanc_sn"]

@@ -101,7 +101,6 @@ class KStartupRAGEngine:
                     region_bonus = 0.05
 
             raw_sum = base_score + keyword_score + stage_bonus + region_bonus
-            # 기존 순위를 보존하면서 점수 편차를 확대하는 단조 변환 적용
             final_score = StartupTaxonomyGraphEngine.stretch_score_contrast(raw_sum + 0.12)
 
             doc_copy = dict(doc)
@@ -139,13 +138,10 @@ class MCPServerRegistry:
         return [
             {
                 "name": "mcp_kstartup_crawl_ongoing",
-                "description": "K-Startup '모집중' 세션에서 최신 공고 데이터를 크롤링하고 RAG 벡터 인덱스 및 GraphDB 택사노미를 갱신합니다.",
+                "description": "K-Startup '모집중' 공고 데이터셋(mock_data.json)을 로드하고 RAG 벡터 인덱스 및 GraphDB 택사노미를 갱신합니다.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {
-                        "max_pages": {"type": "integer", "default": 1},
-                        "force_mock": {"type": "boolean", "default": False},
-                    },
+                    "properties": {},
                 },
             },
             {
@@ -194,11 +190,7 @@ class MCPServerRegistry:
 
     def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         if tool_name == "mcp_kstartup_crawl_ongoing":
-            max_pages = arguments.get("max_pages", 1)
-            force_mock = arguments.get("force_mock", False)
-            data, status = self.crawler.fetch_ongoing_announcements(
-                max_pages=max_pages, force_mock=force_mock
-            )
+            data, status = self.crawler.fetch_ongoing_announcements()
             self.last_crawl_status = status
             indexed_count = self.rag_engine.build_index(data)
             graph_stats = self.graph_engine.build_knowledge_graph(data)
@@ -220,7 +212,7 @@ class MCPServerRegistry:
             top_k = arguments.get("top_k", 3)
 
             if not self.rag_engine.is_indexed:
-                data, status = self.crawler.fetch_ongoing_announcements(max_pages=1)
+                data, status = self.crawler.fetch_ongoing_announcements()
                 self.last_crawl_status = status
                 self.rag_engine.build_index(data)
                 self.graph_engine.build_knowledge_graph(data)

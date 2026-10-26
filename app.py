@@ -164,9 +164,7 @@ if "orchestrator" not in st.session_state:
         mcp_server=st.session_state.mcp_server
     )
 if "crawled_data" not in st.session_state:
-    init_data, init_status = st.session_state.crawler.fetch_ongoing_announcements(
-        max_pages=1, force_mock=False
-    )
+    init_data, init_status = st.session_state.crawler.fetch_ongoing_announcements()
     st.session_state.crawled_data = init_data
     st.session_state.mcp_server.last_crawl_status = init_status
     st.session_state.rag_engine.build_index(init_data)
@@ -181,23 +179,12 @@ with st.sidebar:
     st.title("패스파인더 컨트롤러")
     st.caption("ReAct · MCP · RAG · GraphDB · Orchestration")
 
-    st.subheader("데이터 수집 설정")
-    crawl_mode_choice = st.radio(
-        "K-Startup 모집중 데이터 수집 방식",
-        options=[
-            "실시간 크롤링 우선",
-            "샘플 데이터 사용",
-        ],
-        index=0,
-    )
-    force_mock = "샘플" in crawl_mode_choice
-    max_pages = st.slider("크롤링 탐색 페이지 수", min_value=1, max_value=5, value=1)
-
-    if st.button("모집중 공고 갱신 및 인덱싱", use_container_width=True):
-        with st.spinner("데이터를 수집하고 RAG 및 GraphDB 인덱스를 갱신 중입니다..."):
+    st.subheader("데이터셋 관리")
+    if st.button("공고 데이터셋 로드 및 인덱싱 갱신", use_container_width=True):
+        with st.spinner("mock_data.json을 로드하고 RAG 및 GraphDB 인덱스를 갱신 중입니다..."):
             res = st.session_state.mcp_server.call_tool(
                 "mcp_kstartup_crawl_ongoing",
-                {"max_pages": max_pages, "force_mock": force_mock},
+                {},
             )
             st.session_state.crawled_data = st.session_state.rag_engine.documents
             st.success(f"인덱싱 완료: {res['indexed_count']}건")
@@ -205,7 +192,7 @@ with st.sidebar:
     st.divider()
     st.subheader("시스템 파이프라인 상태")
     st.info(
-        f"**수집 상태:**\n{st.session_state.mcp_server.last_crawl_status}\n\n"
+        f"**데이터 로드 상태:**\n{st.session_state.mcp_server.last_crawl_status}\n\n"
         f"**RAG 인덱스 문서 수:** `{len(st.session_state.crawled_data)}건`\n\n"
         f"**GraphDB 노드 / 엣지:** `{len(st.session_state.graph_engine.nodes)}개` / `{len(st.session_state.graph_engine.edges)}개`\n\n"
         f"**등록된 MCP 도구:** `{len(st.session_state.mcp_server.list_tools())}개`"
@@ -401,7 +388,6 @@ with tab_agent:
                     user_profile=user_profile,
                     user_query=u_query,
                     force_refresh_crawl=False,
-                    force_mock_crawl=force_mock,
                 )
             )
 

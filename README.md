@@ -21,9 +21,8 @@ VSCode 터미널(`Ctrl + ~`)을 열고 아래 명령어를 입력하세요.
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
-```
+
 ### 2단계: streamlit run을 이용해 app.py 실행
 
 ```bash
 streamlit run .\app.py
-```
