@@ -7,10 +7,16 @@ from graph_db_engine import StartupTaxonomyGraphEngine
 
 class KStartupRAGEngine:
     """
-    수집된 K-Startup '모집중' 공고를 인덱싱하고,
-    다중 지표(벡터 유사도, 키워드 일치, 창업단계·지역 정합성) 기반의
-    정밀 근거(Evidence)를 산출하는 RAG 엔진
+    모집중 공고를 인덱싱하고, 100점 만점 다중 지표(벡터 유사도 25점 + 키워드 25점 +
+    페르소나 업력 적격성 35점 + 지역 적격성 15점)를 산출한 뒤,
+    3단계 통계 스케일링(20점 단위 지수 도약 -> IQR 이상치 보정 -> Z-Score 로지스틱 변환)을
+    적용하여 정밀 근거(Evidence)를 도출하는 RAG 엔진
     """
+
+    STOPWORDS = {
+        "현재", "있는", "위한", "이상", "모집중", "공고를", "공고",
+        "추천해주세요", "지원과", "가능한", "필요합니다", "찾고", "있습니다",
+    }
 
     def __init__(self):
         self.documents: List[Dict[str, Any]] = []
@@ -25,9 +31,12 @@ class KStartupRAGEngine:
             return 0
 
         corpus = [
-            f"{doc.get('title', '')} {doc.get('category', '')} "
-            f"{doc.get('organization', '')} {doc.get('target_stage', '')} "
-            f"{doc.get('region', '')} {doc.get('summary', '')}"
+            doc.get("_search_text")
+            or (
+                f"{doc.get('title', '')} {doc.get('category', '')} "
+                f"{doc.get('organization', '')} {doc.get('target_stage', '')} "
+                f"{doc.get('region', '')} {doc.get('summary', '')}"
+            ).lower()
             for doc in self.documents
         ]
         self.tfidf_matrix = self.vectorizer.fit_transform(corpus)
@@ -52,70 +61,91 @@ class KStartupRAGEngine:
         if not self.is_indexed or not self.documents:
             return []
 
-        query_vec = self.vectorizer.transform([query])
+        persona_label = StartupTaxonomyGraphEngine.map_stage_to_persona(user_stage)
+        query_vec = self.vectorizer.transform([query.lower()])
         similarities = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
 
-        stopwords = {"현재", "있는", "위한", "이상", "모집중", "공고를", "공고", "추천해주세요", "지원과", "가능한"}
-        query_terms = [
-            t.strip()
-            for t in query.lower().split()
-            if len(t.strip()) >= 2 and t.strip() not in stopwords
-        ]
+        query_terms = list(
+            dict.fromkeys(
+                t.strip()
+                for t in query.lower().split()
+                if len(t.strip()) >= 2 and t.strip() not in self.STOPWORDS
+            )
+        )
 
-        scored_docs = []
+        candidate_docs: List[Dict[str, Any]] = []
+        raw_scores_100: List[float] = []
+
         for idx, doc in enumerate(self.documents):
             if category_filter != "전체" and category_filter not in doc.get("category", ""):
                 continue
 
-            base_score = float(similarities[idx])
-            doc_text = (
-                f"{doc.get('title', '')} {doc.get('category', '')} "
+            # 1) TF-IDF 코사인 유사도 점수 (최대 25점)
+            raw_cosine = float(similarities[idx])
+            tfidf_pts = min(raw_cosine * 65.0, 25.0)
+
+            # 2) 키워드 일치 점수 (제목 일치 가중치 우대, 최대 25점)
+            title_lower = doc.get("title", "").lower()
+            doc_text = doc.get("_search_text") or (
+                f"{title_lower} {doc.get('category', '')} "
                 f"{doc.get('target_stage', '')} {doc.get('region', '')} {doc.get('summary', '')}"
             ).lower()
 
             matched_terms = []
+            kw_pts = 0.0
             for term in query_terms:
-                if term in doc_text and term not in matched_terms:
+                if term in title_lower:
                     matched_terms.append(term)
+                    kw_pts += 6.5
+                elif term in doc_text:
+                    matched_terms.append(term)
+                    kw_pts += 4.0
+            kw_pts = min(kw_pts, 25.0)
 
-            keyword_score = min(len(matched_terms) * 0.12, 0.48)
+            # 3) 페르소나 적격 기준 기반 업력(최대 35점) 및 지역(최대 15점) 점수
+            eval_res = StartupTaxonomyGraphEngine.evaluate_stage_and_region(
+                persona_label=persona_label,
+                user_region=user_region,
+                ann=doc,
+            )
+            stage_pts = eval_res["stage_score"] * 100.0
+            region_pts = eval_res["region_score"] * 100.0
 
-            target_stage = doc.get("target_stage", "")
-            stage_bonus = 0.0
-            if user_stage:
-                if "예비" in user_stage and ("예비" in target_stage or "전체" in target_stage):
-                    stage_bonus = 0.18
-                elif "초기" in user_stage and ("초기" in target_stage or "3년" in target_stage or "7년" in target_stage):
-                    stage_bonus = 0.18
-                elif "도약" in user_stage and ("도약" in target_stage or "7년" in target_stage):
-                    stage_bonus = 0.18
-                elif "글로벌" in user_stage and ("글로벌" in doc_text or "해외" in doc_text or "7년" in target_stage):
-                    stage_bonus = 0.18
+            # 업력 부적격(0점) 공고는 고득점 후보에서 배제되도록 페널티 부여
+            if stage_pts <= 5.0:
+                raw_100 = max((tfidf_pts + kw_pts) * 0.35, 13.0)
+            else:
+                raw_100 = min(tfidf_pts + kw_pts + stage_pts + region_pts, 100.0)
 
-            doc_region = doc.get("region", "전국")
-            region_bonus = 0.0
-            if user_region:
-                if user_region in doc_region:
-                    region_bonus = 0.10
-                elif "전국" in doc_region or user_region == "전국 무관":
-                    region_bonus = 0.05
-
-            raw_sum = base_score + keyword_score + stage_bonus + region_bonus
-            final_score = StartupTaxonomyGraphEngine.stretch_score_contrast(raw_sum + 0.12)
-
-            doc_copy = dict(doc)
-            doc_copy["rag_score"] = final_score
+            doc_copy = {k: v for k, v in doc.items() if k != "_search_text"}
+            doc_copy["_raw_100"] = round(raw_100, 2)
             doc_copy["evidence_detail"] = {
-                "tfidf_cosine": round(base_score, 3),
-                "keyword_boost": round(keyword_score, 3),
-                "stage_bonus": round(stage_bonus, 3),
-                "region_bonus": round(region_bonus, 3),
+                "tfidf_cosine": round(raw_cosine, 3),
+                "keyword_boost": round(kw_pts / 100.0, 3),
+                "stage_bonus": round(eval_res["stage_score"], 3),
+                "region_bonus": round(eval_res["region_score"], 3),
                 "matched_terms": matched_terms[:8],
+                "persona_criteria_basis": eval_res["criteria_basis"],
             }
-            scored_docs.append(doc_copy)
+            candidate_docs.append(doc_copy)
+            raw_scores_100.append(raw_100)
 
-        scored_docs.sort(key=lambda x: x["rag_score"], reverse=True)
-        return scored_docs[:top_k]
+        # 전체 후보군에 대해 3단계 통계 스케일링(상위 3~4건 >= 0.80) 일괄 적용
+        scaled_scores = StartupTaxonomyGraphEngine.scale_scores_distribution(
+            raw_scores_100=raw_scores_100,
+            top_target_count=4,
+        )
+
+        for doc_copy, s_score in zip(candidate_docs, scaled_scores):
+            doc_copy["rag_score"] = s_score
+
+        candidate_docs.sort(
+            key=lambda x: (x["rag_score"], x.get("_raw_100", 0.0)), reverse=True
+        )
+        for d in candidate_docs:
+            d.pop("_raw_100", None)
+
+        return candidate_docs[:top_k]
 
 
 class MCPServerRegistry:
@@ -161,7 +191,7 @@ class MCPServerRegistry:
             },
             {
                 "name": "mcp_analyze_startup_eligibility",
-                "description": "후보 공고의 지원대상·주관지역·마감일과 사용자 프로필을 교차 검증하여 적격 여부와 리스크를 평가합니다.",
+                "description": "3대 페르소나 적격 판단 기준에 따라 후보 공고의 지원대상·주관지역·마감일과 사용자 프로필을 교차 검증합니다.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -238,56 +268,34 @@ class MCPServerRegistry:
             user_stage = arguments.get("user_stage", "예비창업자")
             user_region = arguments.get("user_region", "서울")
             candidates = arguments.get("candidates", [])
+            persona_label = StartupTaxonomyGraphEngine.map_stage_to_persona(user_stage)
+            persona_criteria = StartupTaxonomyGraphEngine.get_persona_criteria_info(persona_label)
 
             audit_results = []
             for c in candidates:
-                target = c.get("target_stage", "")
-                region = c.get("region", "전국")
-                summary = c.get("summary", "")
-
-                if "예비" in user_stage:
-                    if "3~7년" in target or "3년 초과" in target:
-                        stage_verdict = "부적합 가능성 높음 (기창업 도약기 전용 공고)"
-                    elif "3년 이내" in target and "예비" not in target:
-                        stage_verdict = "조건부 주의 (사업자등록 완료 기업 대상 여부 확인 필요)"
-                    else:
-                        stage_verdict = "적합 (예비창업자 지원 가능)"
-                elif "초기" in user_stage:
-                    if target == "예비창업자" and "초기" not in target:
-                        stage_verdict = "부적합 가능성 높음 (사업자 미등록 예비창업자 전용)"
-                    elif "3~7년" in target or "3년 초과" in target:
-                        stage_verdict = "조건부 주의 (창업 3년 초과 요건 확인 필요)"
-                    else:
-                        stage_verdict = "적합 (초기창업 3년 이내 지원 가능)"
-                elif "도약" in user_stage:
-                    if "예비" in target and "도약" not in target and "7년" not in target:
-                        stage_verdict = "부적합 가능성 높음 (예비·초기 기업 전용)"
-                    else:
-                        stage_verdict = "적합 (창업 3~7년 도약기 지원 가능)"
-                else:
-                    stage_verdict = f"공고문 기준 확인 ({target})"
-
-                if "전국" in region or user_region in region or user_region == "전국 무관":
-                    region_verdict = f"적합 (공고 지역: {region})"
-                else:
-                    region_verdict = f"주의 (주관 지역 '{region}' 소재 또는 이전 조건 확인 필요)"
-
+                eval_res = StartupTaxonomyGraphEngine.evaluate_stage_and_region(
+                    persona_label=persona_label,
+                    user_region=user_region,
+                    ann=c,
+                )
                 audit_results.append(
                     {
                         "pbanc_sn": c.get("pbanc_sn"),
                         "title": c.get("title"),
-                        "target_stage": target,
-                        "stage_verdict": stage_verdict,
-                        "region_verdict": region_verdict,
+                        "target_stage": c.get("target_stage", ""),
+                        "persona_applied": persona_label,
+                        "criteria_basis": eval_res["criteria_basis"],
+                        "stage_verdict": eval_res["stage_verdict"],
+                        "region_verdict": eval_res["region_verdict"],
                         "d_day": c.get("d_day"),
                         "deadline": c.get("deadline"),
-                        "key_benefit": summary,
+                        "key_benefit": c.get("summary", ""),
                     }
                 )
 
             checklist = [
-                f"업력 기준일 대조: '{user_stage}' 기준으로 공고문에 명시된 업력 산정 기준일(공고일 기준 사업자등록증 개업연월일 또는 법인등기부등본 설립일) 충족 여부 확인",
-                "지원 제외 대상 점검: 금융기관 채무불이행, 국세·지방세 체납, 중기부 사업화 지원사업 중복 수혜 해당 여부 사전 점검",
+                f"[{persona_label} 적격 기준 대조] {persona_criteria['criteria_summary']}",
+                "지원 제외 대상 점검: 금융기관 채무불이행, 국세·지방세 체납, 중기부 동일 창업사업화 지원사업 중복 수혜 여부 사전 점검",
                 "제출서류 양식 준수: 공고 상세페이지에 첨부된 최신 PSST(Problem-Solution-Scaleup-Team) 사업계획서 양식 사용 필수",
             ]
             return {
@@ -295,6 +303,7 @@ class MCPServerRegistry:
                 "tool": tool_name,
                 "status": "success",
                 "evaluated_count": len(candidates),
+                "persona_criteria_info": persona_criteria,
                 "eligibility_audit": audit_results,
                 "strategic_checklist": checklist,
             }

@@ -1,7 +1,5 @@
 import json
-import re
-from datetime import datetime, date
-from typing import Optional
+from datetime import date
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -26,37 +24,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
-
-def parse_deadline_to_date(deadline_str: str) -> Optional[date]:
-    if not deadline_str:
-        return None
-
-    text = str(deadline_str)
-
-    full_match = re.search(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", text)
-    if full_match:
-        try:
-            return date(
-                int(full_match.group(1)),
-                int(full_match.group(2)),
-                int(full_match.group(3)),
-            )
-        except ValueError:
-            return None
-
-    short_match = re.search(r"(\d{1,2})[-./](\d{1,2})", text)
-    if short_match:
-        try:
-            return date(
-                datetime.now().year,
-                int(short_match.group(1)),
-                int(short_match.group(2)),
-            )
-        except ValueError:
-            return None
-
-    return None
 
 
 def inject_ux_enhancements():
@@ -247,8 +214,8 @@ with tab_crawler:
 
     if not df.empty:
         filtered_df = df.copy()
-        filtered_df["_parsed_deadline"] = filtered_df["deadline"].apply(
-            parse_deadline_to_date
+        filtered_df["_deadline_date"] = filtered_df["_parsed_deadline"].apply(
+            lambda x: date.fromisoformat(x) if isinstance(x, str) and x else None
         )
 
         if selected_cat != "전체":
@@ -264,35 +231,34 @@ with tab_crawler:
             if len(deadline_range) == 2:
                 start_date, end_date = deadline_range
                 filtered_df = filtered_df[
-                    filtered_df["_parsed_deadline"].notna()
-                    & (filtered_df["_parsed_deadline"] >= start_date)
-                    & (filtered_df["_parsed_deadline"] <= end_date)
+                    filtered_df["_deadline_date"].notna()
+                    & (filtered_df["_deadline_date"] >= start_date)
+                    & (filtered_df["_deadline_date"] <= end_date)
                 ]
             elif len(deadline_range) == 1:
                 start_date = deadline_range[0]
                 filtered_df = filtered_df[
-                    filtered_df["_parsed_deadline"].notna()
-                    & (filtered_df["_parsed_deadline"] >= start_date)
+                    filtered_df["_deadline_date"].notna()
+                    & (filtered_df["_deadline_date"] >= start_date)
                 ]
 
         with col_f4:
             st.metric("조회 공고 수", f"{len(filtered_df)} / {len(df)} 건")
 
+        display_cols = [
+            "pbanc_sn",
+            "status",
+            "category",
+            "d_day",
+            "title",
+            "organization",
+            "target_stage",
+            "region",
+            "deadline",
+            "detail_url",
+        ]
         st.dataframe(
-            filtered_df[
-                [
-                    "pbanc_sn",
-                    "status",
-                    "category",
-                    "d_day",
-                    "title",
-                    "organization",
-                    "target_stage",
-                    "region",
-                    "deadline",
-                    "detail_url",
-                ]
-            ],
+            filtered_df[display_cols],
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -309,7 +275,10 @@ with tab_crawler:
             },
         )
 
-        export_df = filtered_df.drop(columns=["_parsed_deadline"], errors="ignore")
+        export_df = filtered_df.drop(
+            columns=["_parsed_deadline", "_deadline_date", "_search_text"],
+            errors="ignore",
+        )
         dl_col1, dl_col2 = st.columns(2)
         with dl_col1:
             csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
@@ -413,38 +382,62 @@ with tab_agent:
 
                 st.info(f"**Reflection (성찰 및 자기검증):**\n{step_info.get('reflection', '')}")
 
-        st.markdown("### 2. 매칭된 모집중 공고 요약")
-        matched = result["matched_announcements"]
-        if matched:
-            cols = st.columns(len(matched))
-            for idx, doc in enumerate(matched):
-                with cols[idx]:
-                    with st.container(border=True):
-                        st.markdown(f"**{doc['category']}** | `{doc['d_day']}`")
-                        st.markdown(f"#### {doc['title']}")
-                        st.caption(
-                            f"주관: {doc['organization']} | 대상: {doc['target_stage']}"
-                        )
-                        st.progress(
-                            min(float(doc["rag_score"]), 1.0),
-                            text=f"RAG 매칭 점수: {doc['rag_score']} | Graph 연관도: {doc.get('graph_score', 0.0)}",
-                        )
-                        st.caption(f"GraphDB 연결 과제: {doc.get('graph_core_need', '-')}")
-                        ev_terms = doc.get("evidence_detail", {}).get("matched_terms", [])
-                        if ev_terms:
-                            st.caption(f"일치 키워드: {', '.join(ev_terms)}")
-                        st.write(doc["summary"])
-                        st.link_button(
-                            "공고 원문 보기",
-                            doc["detail_url"],
-                            use_container_width=True,
-                        )
-        else:
-            st.warning("조건에 부합하는 공고가 없습니다.")
+        # [출력 방식 1] 되묻기(Ask-back) 발동 시 추천 결과 대신 되묻기 안내 출력
+        if result.get("is_ask_back"):
+            ask_info = result.get("ask_back_info", {})
+            p_crit = ask_info.get("persona_criteria", {})
+            st.markdown("### 2. 추가 정보 확인 및 되묻기 (Ask-back)")
+            with st.container(border=True):
+                st.warning(
+                    "입력하신 프로필 또는 상세 조건에서 적격 판정을 위한 근거가 부족하거나 상호 충돌하는 항목이 감지되어 공고 추천을 보류했습니다."
+                )
+                st.markdown("#### 감지된 근거 부족 / 충돌 사유")
+                for r in ask_info.get("reasons", []):
+                    st.markdown(f"- {r}")
 
-        st.markdown("### 3. 최종 종합 분석 보고서")
-        with st.container(border=True):
-            st.markdown(result["final_report"])
+                st.markdown("#### 정확한 맞춤 추천을 위해 아래 사항을 확인하여 다시 입력해 주십시오")
+                for idx, q in enumerate(ask_info.get("questions", []), 1):
+                    st.markdown(f"**질문 {idx}.** {q}")
+
+                st.divider()
+                st.markdown(
+                    f"**[참고] 선택하신 '{p_crit.get('persona', '')}' 페르소나 적격 판단 기준 ({p_crit.get('career_range', '')})**"
+                )
+                for c_line in p_crit.get("eligibility_criteria", []):
+                    st.markdown(f"- {c_line}")
+        else:
+            st.markdown("### 2. 매칭된 모집중 공고 요약")
+            matched = result["matched_announcements"]
+            if matched:
+                cols = st.columns(len(matched))
+                for idx, doc in enumerate(matched):
+                    with cols[idx]:
+                        with st.container(border=True):
+                            st.markdown(f"**{doc['category']}** | `{doc['d_day']}`")
+                            st.markdown(f"#### {doc['title']}")
+                            st.caption(
+                                f"주관: {doc['organization']} | 대상: {doc['target_stage']}"
+                            )
+                            st.progress(
+                                min(float(doc["rag_score"]), 1.0),
+                                text=f"RAG 매칭 점수: {doc['rag_score']} | Graph 연관도: {doc.get('graph_score', 0.0)}",
+                            )
+                            st.caption(f"GraphDB 연결 과제: {doc.get('graph_core_need', '-')}")
+                            ev_terms = doc.get("evidence_detail", {}).get("matched_terms", [])
+                            if ev_terms:
+                                st.caption(f"일치 키워드: {', '.join(ev_terms)}")
+                            st.write(doc["summary"])
+                            st.link_button(
+                                "공고 원문 보기",
+                                doc["detail_url"],
+                                use_container_width=True,
+                            )
+            else:
+                st.warning("조건에 부합하는 공고가 없습니다.")
+
+            st.markdown("### 3. 최종 종합 분석 보고서")
+            with st.container(border=True):
+                st.markdown(result["final_report"])
 
 # =====================================================================
 # TAB 3: MCP 레지스트리 및 아키텍처 모니터
@@ -505,7 +498,8 @@ with tab_graph:
     if selected_persona in StartupTaxonomyGraphEngine.PERSONA_TAXONOMY:
         p_meta = StartupTaxonomyGraphEngine.PERSONA_TAXONOMY[selected_persona]
         st.info(
-            f"**[{p_meta['label']}] 도메인 정의 ({p_meta['career_range']}):** {p_meta['description']}"
+            f"**[{p_meta['label']}] 도메인 정의 ({p_meta['career_range']}):** {p_meta['description']}\n\n"
+            f"**[적격 판단 기준 근거]:** {p_meta['criteria_summary']}"
         )
 
     subgraph_data = st.session_state.graph_engine.query_persona_subgraph(
