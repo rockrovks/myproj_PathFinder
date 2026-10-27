@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import date
 import pandas as pd
 import streamlit as st
@@ -14,16 +15,46 @@ st.set_page_config(
     layout="wide",
 )
 
+# 입력 안내 문구 숨김 + 상단 필터 박스 내 텍스트 '...' 잘림(ellipsis) 방지 CSS 최적화
 st.markdown(
     """
     <style>
     div[data-testid="InputInstructions"] {
         display: none !important;
     }
+    div[data-baseweb="select"] > div {
+        padding-left: 8px !important;
+        padding-right: 6px !important;
+    }
+    div[data-baseweb="select"] span,
+    div[data-baseweb="select"] div {
+        white-space: nowrap !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        font-size: 0.92rem !important;
+    }
+    div[data-testid="stWidgetLabel"] p {
+        white-space: nowrap !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        font-size: 0.88rem !important;
+        font-weight: 600 !important;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.45rem !important;
+        white-space: nowrap !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+
+def extract_dday_int(dday_str: str) -> int:
+    m = re.search(r"(\d+)", str(dday_str))
+    return int(m.group(1)) if m else 999
 
 
 def inject_ux_enhancements():
@@ -189,7 +220,11 @@ with tab_crawler:
     st.subheader("K-Startup 모집중 사업공고 데이터")
 
     df = pd.DataFrame(st.session_state.crawled_data)
-    col_f1, col_f2, col_f3, col_f4 = st.columns([1.4, 2.0, 1.8, 0.9])
+
+    # 텍스트가 '...'으로 잘리지 않도록 5개 필터 컬럼의 폭 비율 최적화
+    col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns(
+        [1.15, 1.55, 1.95, 1.55, 0.95], gap="small"
+    )
 
     with col_f1:
         categories = (
@@ -200,12 +235,22 @@ with tab_crawler:
         selected_cat = st.selectbox("지원분야", categories)
 
     with col_f2:
-        keyword_filter = st.text_input(
-            "모집공고명 검색",
-            placeholder="예: 예비창업, 초기창업, 디딤돌, 입주기업",
+        search_mode = st.selectbox(
+            "검색 모드",
+            options=[
+                "제목 검색 (정규식)",
+                "제목+내용 (규칙+LLM 연관)",
+            ],
+            index=0,
         )
 
     with col_f3:
+        keyword_filter = st.text_input(
+            "검색 키워드 입력",
+            placeholder="예: 헬스케어, 시제품, 입주, R&D, 글로벌",
+        )
+
+    with col_f4:
         deadline_range = st.date_input(
             "마감일자 기간 선택",
             value=(),
@@ -218,15 +263,11 @@ with tab_crawler:
             lambda x: date.fromisoformat(x) if isinstance(x, str) and x else None
         )
 
+        # 1) 지원분야 필터
         if selected_cat != "전체":
             filtered_df = filtered_df[filtered_df["category"] == selected_cat]
 
-        if keyword_filter:
-            mask = filtered_df["title"].str.contains(
-                keyword_filter.strip(), case=False, na=False
-            )
-            filtered_df = filtered_df[mask]
-
+        # 2) 마감일자 기간 필터
         if isinstance(deadline_range, (tuple, list)):
             if len(deadline_range) == 2:
                 start_date, end_date = deadline_range
@@ -242,30 +283,108 @@ with tab_crawler:
                     & (filtered_df["_deadline_date"] >= start_date)
                 ]
 
-        with col_f4:
+        # 3) 키워드 검색 모드별 분기
+        expanded_info = None
+        is_hybrid_mode = "제목+내용" in search_mode
+
+        if keyword_filter and keyword_filter.strip():
+            kw_str = keyword_filter.strip()
+            if not is_hybrid_mode:
+                # 제목 검색 (정규식 모드 - 잘못된 정규식 문법 입력 시 일반 문자열 검색으로 안전 처리)
+                try:
+                    mask = filtered_df["title"].str.contains(
+                        kw_str, case=False, na=False, regex=True
+                    )
+                except re.error:
+                    mask = filtered_df["title"].str.contains(
+                        kw_str, case=False, na=False, regex=False
+                    )
+                filtered_df = filtered_df[mask]
+            else:
+                # 제목+내용 (규칙 엔진 + LLM 하이브리드 연관 확장 검색 모드)
+                hybrid_res = st.session_state.orchestrator.hybrid_table_search(
+                    raw_query=kw_str,
+                    records=filtered_df.to_dict(orient="records"),
+                )
+                expanded_info = hybrid_res["expanded_info"]
+                matched_records = hybrid_res["matched_records"]
+                if matched_records:
+                    filtered_df = pd.DataFrame(matched_records)
+                else:
+                    filtered_df = filtered_df.iloc[0:0].copy()
+
+        with col_f5:
             st.metric("조회 공고 수", f"{len(filtered_df)} / {len(df)} 건")
 
-        display_cols = [
-            "pbanc_sn",
-            "status",
-            "category",
-            "d_day",
-            "title",
-            "organization",
-            "target_stage",
-            "region",
-            "deadline",
-            "detail_url",
-        ]
+        # 하이브리드 연관 검색 시 확장된 키워드 풀 표시
+        if is_hybrid_mode and expanded_info and keyword_filter.strip():
+            rule_kws = expanded_info.get("rule_expanded", [])
+            llm_kws = expanded_info.get("llm_expanded", [])
+            st.caption(
+                f"**[하이브리드 연관 키워드 확장 결과]** "
+                f"직접 입력: `{', '.join(expanded_info.get('base_terms', []))}` | "
+                f"규칙 엔진 확장: `{', '.join(rule_kws) if rule_kws else '없음'}` | "
+                f"LLM 의미 확장: `{', '.join(llm_kws) if llm_kws else '비활성(또는 추가 없음)'}`"
+            )
+
+        # 컬럼 헤더 클릭 시 숫자/날짜/점수 오름·내림차순 정렬이 정확히 작동하도록 타입 정비
+        if not filtered_df.empty:
+            filtered_df["pbanc_sn_num"] = pd.to_numeric(
+                filtered_df["pbanc_sn"], errors="coerce"
+            ).fillna(0).astype(int)
+            filtered_df["d_day_num"] = filtered_df["d_day"].apply(extract_dday_int)
+        else:
+            filtered_df["pbanc_sn_num"] = pd.Series(dtype="int64")
+            filtered_df["d_day_num"] = pd.Series(dtype="int64")
+
+        st.caption("표 상단의 각 컬럼 이름을 클릭하면 오름차순(▲) 또는 내림차순(▼)으로 정렬할 수 있습니다.")
+
+        if is_hybrid_mode and keyword_filter.strip():
+            if "match_score" not in filtered_df.columns:
+                filtered_df["match_score"] = pd.Series(dtype="float64")
+            if "matched_keywords" not in filtered_df.columns:
+                filtered_df["matched_keywords"] = pd.Series(dtype="object")
+
+            display_cols = [
+                "pbanc_sn_num",
+                "match_score",
+                "matched_keywords",
+                "category",
+                "d_day_num",
+                "title",
+                "organization",
+                "target_stage",
+                "region",
+                "deadline",
+                "detail_url",
+            ]
+        else:
+            display_cols = [
+                "pbanc_sn_num",
+                "status",
+                "category",
+                "d_day_num",
+                "title",
+                "organization",
+                "target_stage",
+                "region",
+                "deadline",
+                "detail_url",
+            ]
+
         st.dataframe(
             filtered_df[display_cols],
             use_container_width=True,
             hide_index=True,
             column_config={
-                "pbanc_sn": "공고번호",
+                "pbanc_sn_num": st.column_config.NumberColumn("공고번호", format="%d"),
                 "status": "상태",
+                "match_score": st.column_config.ProgressColumn(
+                    "연관도 점수", min_value=0.0, max_value=1.0, format="%.2f"
+                ),
+                "matched_keywords": "매칭된 연관 키워드",
                 "category": "지원분야",
-                "d_day": "D-Day",
+                "d_day_num": st.column_config.NumberColumn("D-Day", format="D-%d"),
                 "title": "모집공고명",
                 "organization": "주관기관",
                 "target_stage": "대상단계",
@@ -276,7 +395,14 @@ with tab_crawler:
         )
 
         export_df = filtered_df.drop(
-            columns=["_parsed_deadline", "_deadline_date", "_search_text"],
+            columns=[
+                "_parsed_deadline",
+                "_deadline_date",
+                "_search_text",
+                "_raw_match_score",
+                "pbanc_sn_num",
+                "d_day_num",
+            ],
             errors="ignore",
         )
         dl_col1, dl_col2 = st.columns(2)
@@ -382,7 +508,6 @@ with tab_agent:
 
                 st.info(f"**Reflection (성찰 및 자기검증):**\n{step_info.get('reflection', '')}")
 
-        # [출력 방식 1] 되묻기(Ask-back) 발동 시 추천 결과 대신 되묻기 안내 출력
         if result.get("is_ask_back"):
             ask_info = result.get("ask_back_info", {})
             p_crit = ask_info.get("persona_criteria", {})

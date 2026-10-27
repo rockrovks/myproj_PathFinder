@@ -1,5 +1,7 @@
+import json
 import os
 import re
+from datetime import datetime
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 from mcp_rag_engine import MCPServerRegistry
@@ -15,9 +17,10 @@ except ImportError:
 
 class StartupPathfinderOrchestrator:
     """
-    [Orchestration + ReAct + 입력 근거 검증 및 되묻기(Ask-back) 게이트]
-    1. 사용자 입력 근거 부족 또는 프로필-질문 간 업력 충돌 감지 시 즉시 되묻기(방식 1) 응답 반환
-    2. 정상 입력 시 RAG + GraphDB + 페르소나 적격 기준 검증을 수행하여 최종 보고서 생성
+    [Orchestration + ReAct + 하이브리드(규칙 + LLM) 프로필-프롬프트 충돌 검증 및 연관 검색 엔진]
+    1. 프로필 4대 항목과 수기 프롬프트 간의 불일치·충돌을 규칙 엔진 + LLM으로 판별하여 되묻기(Ask-back) 수행
+    2. 탭 1 공고 목록에서 '제목+내용 (규칙+LLM 연관)' 선택 시 연관 키워드 확장 검색 수행
+    3. 탭 2 에이전트 실행 시 RAG + GraphDB + 페르소나 적격 기준 검증을 통해 최종 보고서 생성
     """
 
     SYSTEM_PROMPT = """당신은 대한민국 K-Startup 창업지원 전문 AI 에이전트 '창업 패스파인더'입니다.
@@ -26,7 +29,7 @@ class StartupPathfinderOrchestrator:
 [1. 서식 및 근거 기반(Grounding) 원칙]
 - 이모티콘을 절대 사용하지 말고 명확하고 격식 있는 비즈니스 보고서 톤으로 작성하십시오.
 - 제공된 공고 데이터(RAG 및 GraphDB 검색 근거)에 없는 지원금액, 자격요건, 일정을 임의로 추측하거나 지어내지 마십시오.
-- 사용자 입력 정보나 공고 원문 요약만으로 판단할 수 없는 세부 자격 요건(예: 동종업종 폐업 경과기간, 세부 매출액, 대표자 연령 제한 등)이 있는 경우 단정하지 말고 추가 확인(되묻기/점검사항) 항목으로 명시하십시오.
+- 사용자 프로필(창업단계, 아이템, 지역, 희망분야)과 상세 요청사항 간의 정합성을 유지하며, 공고 요약만으로 단정할 수 없는 세부 요건(동종업종 폐업 경과기간, 세부 매출액, 대표자 연령 제한 등)은 반드시 추가 확인(되묻기/점검사항) 항목으로 명시하십시오.
 
 [2. 3대 페르소나 적격 판단 기준 근거 (필수 반영)]
 - 예비창업자: 공고일 기준 신청자 명의의 개인·법인 사업자등록 미보유(폐업 이력 시 동종업종 여부 확인) 및 시제품(MVP) 제작·보육공간 입주·BM 멘토링 과제 부합 여부
@@ -38,6 +41,61 @@ class StartupPathfinderOrchestrator:
 2. 에이전트 성찰(Reflection) 기반 유의사항 및 지원 리스크 분석
 3. 마감일(D-Day) 기준 우선순위 실행 로드맵 및 사업계획서(PSST) 작성 전략"""
 
+    CONFLICT_CHECK_SYSTEM_PROMPT = """당신은 창업 지원 에이전트의 '프로필-프롬프트 정합성 및 근거 검증기'입니다.
+사용자가 선택한 [프로필 4대 항목]과 수기로 작성한 [상세 조건 프롬프트]를 비교하여 불일치(충돌)나 심각한 근거 부족이 있는지 판정하십시오.
+
+[검증 대상 4대 항목]
+1. 창업 단계(stage): 프로필의 창업 단계(예비창업자 / 초기창업자 3년 이내 / 도약기 3~7년 이내 / 글로벌·스케일업)와 프롬프트 내 업력·사업자등록 여부·희망 단계 표현이 모순되는 경우
+2. 창업 아이템/기술 분야(domain): 프로필에 입력한 아이템/기술 분야와 프롬프트에서 설명하는 사업 아이템·업종이 서로 다른 산업군으로 충돌하는 경우 (단, 프롬프트에 아이템 언급이 단순히 생략된 경우는 충돌이 아님)
+3. 지역(region): 프로필 선택 지역과 프롬프트에서 명시한 사업장 소재지·희망 지역이 서로 다른 경우 (단, 프롬프트에 지역 언급이 생략된 경우는 충돌이 아님)
+4. 희망 지원 분야(category): 프로필에서 '전체'가 아닌 특정 분야(사업화 / 기술개발(R&D) / 시설ㆍ공간ㆍ보육 / 멘토링ㆍ컨설팅ㆍ교육 / 판로ㆍ해외진출)를 단독 선택했으나, 프롬프트에서는 다른 지원 분야의 혜택을 요청하여 검색 필터링 시 누락이 발생하는 경우
+
+반드시 아래 JSON 형식으로만 응답하십시오:
+{
+  "has_conflict": true 또는 false,
+  "conflicts": ["감지된 구체적인 불일치/충돌 사유 문장 1", ...],
+  "follow_up_questions": ["사용자에게 확인을 요청할 구체적인 되묻기 질문 1", ...]
+}"""
+
+    KEYWORD_EXPAND_SYSTEM_PROMPT = """당신은 대한민국 K-Startup 창업지원사업 검색 키워드 확장기입니다.
+사용자가 입력한 검색어와 의미적·문맥적으로 연관된 창업지원사업 핵심 키워드(기술명, 산업분야, 지원유형, 연관 용어)를 5~8개 추출하십시오.
+반드시 아래 JSON 형식으로만 응답하십시오:
+{
+  "expanded_keywords": ["연관키워드1", "연관키워드2", ...]
+}"""
+
+    REGION_ALIASES: Dict[str, List[str]] = {
+        "서울": ["서울", "마포", "공덕", "홍릉", "강남", "테헤란로", "성수", "여의도", "구로", "가산", "양재"],
+        "경기": ["경기", "판교", "성남", "수원", "광교", "고양", "일산", "용인", "화성", "동탄", "안양", "부천", "시흥"],
+        "인천": ["인천", "송도", "청라", "영종"],
+        "부산": ["부산", "센텀", "해운대", "영도"],
+        "대전": ["대전", "대덕", "유성", "둔산"],
+        "대구": ["대구", "수성", "동대구", "경산"],
+        "광주": ["광주", "상무", "첨단"],
+        "비수도권_기타": [
+            "울산", "세종", "강원", "춘천", "원주", "강릉", "충북", "청주", "충남", "천안", "아산",
+            "전북", "전주", "전남", "여수", "순천", "나주", "경북", "포항", "구미", "경남", "창원", "김해", "진주", "제주",
+        ],
+    }
+
+    CATEGORY_INTENT_KEYWORDS: Dict[str, List[str]] = {
+        "사업화": ["사업화 자금", "사업화지원", "시제품 제작", "시제품", "mvp", "사업화 패키지", "바우처", "사업비", "자금"],
+        "기술개발(R&D)": ["r&d", "기술개발", "디딤돌", "첫걸음", "전략형", "출연금", "연구개발", "팁스", "tips", "상용화"],
+        "시설ㆍ공간ㆍ보육": ["입주", "보육공간", "사무공간", "공유오피스", "창업공간", "사무실", "창업존", "창업캠프", "입주기업", "허브", "센터"],
+        "멘토링ㆍ컨설팅ㆍ교육": ["멘토링", "컨설팅", "부트캠프", "역량강화", "피칭", "네트워킹", "법률", "세무", "노무", "특허", "ir", "투자유치", "교육"],
+        "판로ㆍ해외진출": ["해외진출", "글로벌", "수출", "전시회", "ces", "mwc", "판로", "크라우드펀딩", "공공조달", "나라장터", "마케팅", "바이어"],
+    }
+
+    DOMAIN_CLUSTERS: Dict[str, List[str]] = {
+        "AI·SW·데이터·클라우드": ["ai", "인공지능", "빅데이터", "데이터", "클라우드", "saas", "소프트웨어", "sw", "플랫폼", "앱", "알고리즘", "llm", "생성형", "gpu", "ict"],
+        "바이오·헬스케어·의료": ["헬스케어", "바이오", "의료", "의료기기", "디지털헬스", "신약", "임상", "진단", "병원", "제약", "건강", "식약처"],
+        "모빌리티·로봇·제조·하드웨어": ["모빌리티", "자율주행", "자동차", "미래차", "로봇", "로보틱스", "드론", "반도체", "센서", "하드웨어", "스마트팩토리", "기계", "해양", "물류", "항공"],
+        "친환경·에너지·기후테크": ["친환경", "탄소중립", "탄소", "그린", "에너지", "태양광", "수소", "배터리", "업사이클링", "자원순환", "폐기물", "기후", "esg", "소셜벤처"],
+        "로컬·F&B·외식·소상공인·관광": ["로컬", "f&b", "식음료", "베이커리", "카페", "식당", "음식점", "외식", "밀키트", "전통주", "관광", "숙박", "공간기획", "소상공인", "로컬크리에이터"],
+        "핀테크·블록체인·금융": ["핀테크", "금융", "결제", "블록체인", "자산관리", "인슈어테크", "송금", "보안"],
+        "콘텐츠·미디어·에듀테크·커머스": ["콘텐츠", "웹툰", "게임", "영상", "미디어", "엔터테인먼트", "에듀테크", "교육용", "이커머스", "쇼핑몰", "패션", "뷰티"],
+    }
+
     def __init__(self, mcp_server: MCPServerRegistry):
         self.mcp = mcp_server
         self.env_api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -47,85 +105,400 @@ class StartupPathfinderOrchestrator:
             if (self.has_valid_env_key() and OpenAI is not None)
             else None
         )
+        self._keyword_cache: Dict[str, Dict[str, List[str]]] = {}
 
     def has_valid_env_key(self) -> bool:
         return bool(self.env_api_key and not self.env_api_key.startswith("sk-proj-여기에"))
 
-    def _check_input_ask_back(
-        self, user_profile: Dict[str, str], user_query: str, mapped_persona: str
+    # =====================================================================
+    # [탭 1 전용] 방식 A: 규칙 엔진 + LLM 하이브리드 연관 키워드 확장 검색
+    # =====================================================================
+    def expand_search_keywords(self, raw_query: str) -> Dict[str, List[str]]:
+        """
+        입력 검색어를 바탕으로 1) 규칙 사전(도메인/지원분야/페르소나) 연관어와
+        2) LLM 문맥 연관어를 결합하여 확장 키워드 리스트를 반환합니다.
+        """
+        q_clean = raw_query.strip()
+        if not q_clean:
+            return {"base_terms": [], "rule_expanded": [], "llm_expanded": [], "all_terms": []}
+
+        if q_clean in self._keyword_cache:
+            return self._keyword_cache[q_clean]
+
+        q_lower = q_clean.lower()
+        base_terms = [t.strip() for t in re.split(r"[\s,·/]+", q_lower) if len(t.strip()) >= 2]
+        if not base_terms:
+            base_terms = [q_lower]
+
+        rule_expanded: List[str] = []
+
+        # 1) 도메인 클러스터 유의어 확장
+        for _, cluster_kws in self.DOMAIN_CLUSTERS.items():
+            if any(bt in kw or kw in q_lower for bt in base_terms for kw in cluster_kws):
+                for kw in cluster_kws:
+                    if kw not in base_terms and kw not in rule_expanded:
+                        rule_expanded.append(kw)
+
+        # 2) 지원분야 의도 키워드 확장
+        for cat_name, cat_kws in self.CATEGORY_INTENT_KEYWORDS.items():
+            if cat_name.lower() in q_lower or any(bt in kw or kw in q_lower for bt in base_terms for kw in cat_kws):
+                for kw in cat_kws:
+                    if kw not in base_terms and kw not in rule_expanded:
+                        rule_expanded.append(kw)
+
+        # 3) 페르소나 핵심 성장 과제 키워드 확장
+        for _, p_data in StartupTaxonomyGraphEngine.PERSONA_TAXONOMY.items():
+            for need in p_data.get("core_needs", []):
+                need_kws = [k.lower() for k in need.get("keywords", [])]
+                if any(bt in nk or nk in q_lower for bt in base_terms for nk in need_kws):
+                    for nk in need_kws:
+                        if nk not in base_terms and nk not in rule_expanded:
+                            rule_expanded.append(nk)
+
+        rule_expanded = rule_expanded[:10]
+
+        # 4) LLM 의미 기반 연관 키워드 확장
+        llm_expanded: List[str] = []
+        if self.client is not None:
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.env_model,
+                    messages=[
+                        {"role": "system", "content": self.KEYWORD_EXPAND_SYSTEM_PROMPT},
+                        {"role": "user", "content": f"검색어: {q_clean}"},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                )
+                parsed = json.loads(resp.choices[0].message.content or "{}")
+                for kw in parsed.get("expanded_keywords", []):
+                    kw_l = str(kw).strip().lower()
+                    if len(kw_l) >= 2 and kw_l not in base_terms and kw_l not in rule_expanded and kw_l not in llm_expanded:
+                        llm_expanded.append(kw_l)
+                llm_expanded = llm_expanded[:8]
+            except Exception:
+                pass
+
+        all_terms = base_terms + rule_expanded + llm_expanded
+        result = {
+            "base_terms": base_terms,
+            "rule_expanded": rule_expanded,
+            "llm_expanded": llm_expanded,
+            "all_terms": all_terms,
+        }
+        self._keyword_cache[q_clean] = result
+        return result
+
+    def hybrid_table_search(
+        self, raw_query: str, records: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """
-        [발동 조건 A 검사]
-        1) 창업 아이템 또는 상세 조건 텍스트가 지나치게 짧아 추천 근거가 부족한 경우
-        2) 선택한 창업 단계(페르소나)와 상세 질문 내 업력/사업자등록 상태 언급이 상호 충돌하는 경우
+        확장된 키워드 풀(base_terms + rule_expanded + llm_expanded)을 이용해
+        공고의 제목+내용(_search_text)을 탐색하고 연관 점수와 매칭 키워드를 계산합니다.
         """
-        domain = user_profile.get("domain", "").strip()
+        expanded_info = self.expand_search_keywords(raw_query)
+        base_terms = expanded_info["base_terms"]
+        rule_terms = expanded_info["rule_expanded"]
+        llm_terms = expanded_info["llm_expanded"]
+
+        matched_records: List[Dict[str, Any]] = []
+        raw_scores: List[float] = []
+
+        for rec in records:
+            title_l = rec.get("title", "").lower()
+            full_l = rec.get("_search_text") or (
+                f"{title_l} {rec.get('category', '')} {rec.get('organization', '')} "
+                f"{rec.get('target_stage', '')} {rec.get('region', '')} {rec.get('summary', '')}"
+            ).lower()
+
+            score = 0.0
+            hit_keywords: List[str] = []
+
+            # 직접 입력 검색어 매칭 (높은 가중치)
+            for bt in base_terms:
+                if bt in title_l:
+                    score += 38.0
+                    hit_keywords.append(bt)
+                elif bt in full_l:
+                    score += 26.0
+                    hit_keywords.append(bt)
+
+            # 규칙 확장 키워드 매칭 (중간 가중치)
+            for rt in rule_terms:
+                if rt in title_l:
+                    score += 14.0
+                    hit_keywords.append(rt)
+                elif rt in full_l:
+                    score += 9.0
+                    hit_keywords.append(rt)
+
+            # LLM 확장 키워드 매칭 (보조 가중치)
+            for lt in llm_terms:
+                if lt in title_l:
+                    score += 14.0
+                    hit_keywords.append(lt)
+                elif lt in full_l:
+                    score += 9.0
+                    hit_keywords.append(lt)
+
+            if score > 0.0:
+                rec_copy = dict(rec)
+                rec_copy["_raw_match_score"] = min(score, 100.0)
+                rec_copy["matched_keywords"] = ", ".join(list(dict.fromkeys(hit_keywords))[:6])
+                matched_records.append(rec_copy)
+                raw_scores.append(min(score, 100.0))
+
+        if matched_records:
+            scaled = StartupTaxonomyGraphEngine.scale_scores_distribution(
+                raw_scores_100=raw_scores, top_target_count=4
+            )
+            for rec_copy, s_val in zip(matched_records, scaled):
+                rec_copy["match_score"] = s_val
+
+            matched_records.sort(
+                key=lambda x: (x["match_score"], x.get("_raw_match_score", 0.0)),
+                reverse=True,
+            )
+
+        return {
+            "expanded_info": expanded_info,
+            "matched_records": matched_records,
+        }
+
+    # =====================================================================
+    # [탭 2 전용] 프로필-프롬프트 충돌 검증 및 ReAct 파이프라인
+    # =====================================================================
+    def _rule_based_input_check(
+        self, user_profile: Dict[str, str], user_query: str, mapped_persona: str
+    ) -> Dict[str, List[str]]:
         stage = user_profile.get("stage", "예비창업자").strip()
+        domain = user_profile.get("domain", "").strip()
+        region = user_profile.get("region", "서울").strip()
+        category = user_profile.get("category", "전체").strip()
         query_clean = user_query.strip()
+        query_lower = query_clean.lower()
 
         reasons: List[str] = []
         questions: List[str] = []
 
-        # 1. 입력 길이 및 구체성 부족 검사
         if len(domain) < 2:
-            reasons.append("창업 아이템/기술 분야 입력값이 누락되었거나 너무 짧아 기술·산업 분야 매칭 근거를 산출할 수 없습니다.")
-            questions.append("현재 준비 중이거나 개발 중인 핵심 창업 아이템(제품·서비스명)과 주요 기술 분야(예: AI 헬스케어, 친환경 소재, SaaS 등)는 무엇입니까?")
+            reasons.append("창업 아이템/기술 분야 입력값이 누락되었거나 너무 짧아 산업·기술 분야 매칭 근거를 산출할 수 없습니다.")
+            questions.append("현재 준비 중이거나 개발 중인 핵심 창업 아이템(제품·서비스명)과 주요 기술 분야는 무엇입니까?")
 
         if len(query_clean) < 10:
             reasons.append("상세 조건 및 고민 내용이 10자 미만으로 입력되어 필요 자금 용도 및 핵심 성장 과제(Core Need)를 특정할 수 없습니다.")
-            questions.append("현재 가장 시급하게 지원받고자 하는 목적(시제품 제작비, R&D 기술개발 출연금, 창업 보육공간 입주, 해외진출, 투자유치 IR 등)을 구체적으로 알려주시겠습니까?")
+            questions.append("현재 가장 시급하게 지원받고자 하는 목적(시제품 제작비, R&D 기술개발 출연금, 창업 보육공간 입주, 해외진출, 투자유치 IR 등)을 구체적으로 입력해 주시겠습니까?")
 
-        # 2. 프로필 창업 단계와 질문 내 업력 표현 간 충돌 검사
-        year_matches = [int(y) for y in re.findall(r"창업\s*(\d+)\s*년", query_clean)]
+        current_year = datetime.now().year
+        year_spans = [
+            int(y)
+            for grp in re.findall(
+                r"(?:창업|설립|업력|개업)\s*(?:한\s*지\s*)?(\d+)\s*년|(\d+)\s*년\s*차",
+                query_clean,
+            )
+            for y in grp
+            if y
+        ]
+        founding_years = [
+            int(fy)
+            for fy in re.findall(r"(20[0-2]\d)\s*년\s*(?:에\s*)?(?:창업|설립|개업|법인)", query_clean)
+        ]
+        for fy in founding_years:
+            if 2000 <= fy <= current_year:
+                year_spans.append(max(current_year - fy, 1))
+
+        has_pre_kw = any(
+            kw in query_clean
+            for kw in ["사업자등록 전", "사업자 등록 전", "미등록 예비", "예비창업자입니다", "예비 창업자입니다", "예비창업팀입니다", "창업 전입니다"]
+        )
+        has_registered_kw = any(
+            kw in query_clean
+            for kw in ["법인 설립 완료", "법인설립 완료", "사업자등록 완료", "사업자 등록 완료", "기창업자입니다", "법인사업자입니다", "시리즈A", "시리즈B", "매출이 발생"]
+        )
 
         if mapped_persona == "예비창업자":
-            conflict_C1 = any(
-                kw in query_clean
-                for kw in ["법인 설립 완료", "법인설립 완료", "사업자등록 완료", "사업자 등록 완료", "기창업자입니다", "법인사업자입니다", "시리즈A", "시리즈B"]
-            )
-            conflict_C2 = any(y >= 1 for y in year_matches)
-            if conflict_C1 or conflict_C2:
+            if has_registered_kw or any(y >= 1 for y in year_spans):
+                yr_info = f"업력 {max(year_spans)}년" if year_spans else "기창업/사업자 보유"
                 reasons.append(
-                    f"선택하신 프로필 단계는 '{stage}(사업자등록 이전)'이나, 상세 조건에는 기창업/업력({year_matches if year_matches else '사업자 보유'}) 관련 내용이 포함되어 있어 페르소나 적격 판단 기준이 충돌합니다."
+                    f"[창업 단계 불일치] 프로필 단계는 '{stage}(사업자등록 이전)'로 선택되었으나, 상세 조건에는 '{yr_info}' 관련 내용이 기재되어 있어 페르소나 적격 판단 기준이 충돌합니다."
                 )
                 questions.append(
-                    "현재 사업자등록증(개인 또는 법인)을 이미 발급받으신 상태입니까? 기창업 상태라면 정확한 개업연월일(또는 법인설립등기일) 기준 업력이 몇 년 몇 개월인지 확인해 주십시오."
+                    "현재 사업자등록증(개인 또는 법인)을 이미 발급받으신 기창업 상태입니까, 아니면 사업자등록 이전인 예비창업 상태입니까?"
+                )
+            elif any(kw in query_clean for kw in ["창업도약패키지", "도약기 기업", "스케일업 팁스"]):
+                reasons.append(
+                    f"[창업 단계 불일치] 프로필 단계는 '{stage}'이나, 상세 조건에서는 기창업 도약기(3~7년) 전용 사업을 요청하고 있습니다."
+                )
+                questions.append(
+                    "예비창업자 대상 공고(예비창업패키지 등)를 찾으십니까, 아니면 업력 3년 초과 도약기 기업 대상 공고를 찾으십니까?"
                 )
 
         elif mapped_persona == "창업 초기(3년 내외) 팀":
-            if any(kw in query_clean for kw in ["사업자등록 전", "사업자 등록 전", "미등록 예비", "예비창업자입니다"]):
+            if has_pre_kw:
                 reasons.append(
-                    f"선택하신 프로필 단계는 '{stage}(업력 3년 이내 기창업)'이나, 상세 조건에는 '사업자등록 전 예비창업자'로 기재되어 있어 적격 기준 적용이 불가합니다."
+                    f"[창업 단계 불일치] 프로필 단계는 '{stage}(업력 3년 이내 기창업)'로 선택되었으나, 상세 조건에는 '사업자등록 전 예비창업자'로 기재되어 있어 적격 기준이 충돌합니다."
                 )
                 questions.append(
-                    "현재 사업자등록 이전인 예비창업 단계이십니까, 아니면 사업자등록을 완료한 창업 3년(36개월) 이내 기업이십니까?"
+                    "현재 사업자등록 이전인 예비창업 단계이십니까, 아니면 사업자등록을 완료한 창업 3년(36개월) 이내 초기기업이십니까?"
                 )
-            elif any(y >= 4 for y in year_matches):
+            elif any(y >= 4 for y in year_spans):
                 reasons.append(
-                    f"선택하신 프로필 단계는 '{stage}(업력 3년 이내)'이나, 상세 조건에는 '창업 {max(year_matches)}년'으로 기재되어 있어 초기창업패키지 등 3년 이내 공고 적격 여부 판정에 충돌이 발생합니다."
+                    f"[창업 단계 불일치] 프로필 단계는 '{stage}(업력 3년 이내)'이나, 상세 조건에는 '업력 {max(year_spans)}년'으로 기재되어 있어 3년 이내 초기창업 기준을 초과합니다."
                 )
                 questions.append(
-                    "사업자등록증상 개업연월일(또는 법인설립등기일)이 공고일 기준 만 3년(36개월)을 초과한 도약기(3~7년) 기업에 해당합니까?"
+                    "사업자등록증상 개업연월일(또는 법인설립등기일) 기준 업력이 만 3년(36개월)을 초과한 도약기(3~7년) 기업이십니까?"
                 )
 
         elif mapped_persona == "그 이상 베테랑 팀":
-            if any(kw in query_clean for kw in ["사업자등록 전", "사업자 등록 전", "예비창업자입니다"]):
+            if has_pre_kw:
                 reasons.append(
-                    f"선택하신 프로필 단계는 '{stage}(3년 초과 도약·스케일업)'이나, 상세 조건에는 '사업자등록 전 예비창업자'로 기재되어 있어 적격 기준이 충돌합니다."
+                    f"[창업 단계 불일치] 프로필 단계는 '{stage}(창업 3년 초과 도약·스케일업)'이나, 상세 조건에는 '사업자등록 전 예비창업자'로 기재되어 있어 적격 기준이 충돌합니다."
                 )
                 questions.append(
-                    "현재 사업자등록 전인 예비창업 단계이십니까, 아니면 창업 3년을 초과한 도약기 기업이십니까?"
+                    "현재 사업자등록 전인 예비창업 단계이십니까, 아니면 창업 3년을 초과한 도약·스케일업 기업이십니까?"
                 )
-            elif any(1 <= y <= 2 for y in year_matches):
+            elif any(1 <= y <= 3 for y in year_spans) and not any(y >= 4 for y in year_spans):
                 reasons.append(
-                    f"선택하신 프로필 단계는 '{stage}(창업 3년 초과)'이나, 상세 조건에는 '창업 {min(year_matches)}년'으로 기재되어 있어 초기(3년 이내)와 도약기(3~7년) 기준이 상충합니다."
+                    f"[창업 단계 불일치] 프로필 단계는 '{stage}(창업 3년 초과 베테랑 팀)'이나, 상세 조건에는 '업력 {min(year_spans)}년'으로 기재되어 있어 초기창업(3년 이내) 기준과 충돌합니다."
                 )
                 questions.append(
                     "현재 기업의 정확한 업력이 만 3년(36개월) 이내인 초기창업 기업입니까, 아니면 만 3년을 초과한 도약기 기업입니까?"
                 )
 
+        if region != "전국 무관":
+            detected_regions: List[str] = []
+            for reg_key, aliases in self.REGION_ALIASES.items():
+                for alias in aliases:
+                    if alias in query_clean:
+                        detected_regions.append(reg_key if reg_key != "비수도권_기타" else alias)
+                        break
+
+            if detected_regions:
+                if region == "비수도권/로컬":
+                    metro_hits = [r for r in detected_regions if r in ("서울", "경기", "인천")]
+                    if metro_hits:
+                        reasons.append(
+                            f"[지역 조건 불일치] 프로필 지역은 '{region}'로 선택되었으나, 상세 조건에는 수도권 지역({', '.join(metro_hits)})이 명시되어 있습니다."
+                        )
+                        questions.append(
+                            f"사업장 소재지(또는 입주·지원 희망 지역)가 '{', '.join(metro_hits)}' 수도권입니까, 아니면 비수도권/로컬 지역입니까?"
+                        )
+                else:
+                    other_regions = [r for r in detected_regions if r != region]
+                    if other_regions and region not in detected_regions:
+                        reasons.append(
+                            f"[지역 조건 불일치] 프로필 지역은 '{region}'로 선택되었으나, 상세 조건에는 다른 지역('{', '.join(other_regions)}')이 명시되어 있습니다."
+                        )
+                        questions.append(
+                            f"현재 거주지 및 사업장 기준 지역을 프로필의 '{region}'로 적용할까요, 아니면 프롬프트에 작성하신 '{', '.join(other_regions)}'로 변경할까요?"
+                        )
+
+        if category != "전체":
+            matched_cats: List[str] = []
+            for cat_name, kw_list in self.CATEGORY_INTENT_KEYWORDS.items():
+                if any(kw in query_lower for kw in kw_list):
+                    matched_cats.append(cat_name)
+
+            other_requested_cats = [c for c in matched_cats if c != category]
+            if other_requested_cats:
+                if category not in matched_cats:
+                    reasons.append(
+                        f"[희망 지원 분야 불일치] 프로필 희망 지원 분야는 '{category}' 단독으로 선택되었으나, 상세 조건에서는 '{', '.join(other_requested_cats)}' 분야의 지원을 요청하고 있습니다."
+                    )
+                    questions.append(
+                        f"탐색할 지원 분야를 프롬프트 내용에 맞춰 '{', '.join(other_requested_cats)}'(또는 '전체')로 변경하시겠습니까, 아니면 '{category}' 분야 공고만 제한하여 검색하시겠습니까?"
+                    )
+                else:
+                    reasons.append(
+                        f"[희망 지원 분야 범위 충돌] 프로필에서는 '{category}' 단일 분야만 선택되었으나, 상세 조건에서는 '{', '.join(other_requested_cats)}' 지원까지 복합적으로 요청하고 있어 단일 분야 필터링 시 타 분야 공고가 누락됩니다."
+                    )
+                    questions.append(
+                        f"'{category}'와 '{', '.join(other_requested_cats)}' 공고를 모두 추천받기 위해 희망 지원 분야를 '전체'로 변경하여 분석할까요?"
+                    )
+
+        if len(domain) >= 2:
+            domain_lower = domain.lower()
+            profile_clusters = {
+                c_name
+                for c_name, c_kws in self.DOMAIN_CLUSTERS.items()
+                if any(kw in domain_lower for kw in c_kws)
+            }
+            query_clusters = {
+                c_name
+                for c_name, c_kws in self.DOMAIN_CLUSTERS.items()
+                if any(kw in query_lower for kw in c_kws)
+            }
+
+            if profile_clusters and query_clusters and profile_clusters.isdisjoint(query_clusters):
+                reasons.append(
+                    f"[창업 아이템/도메인 불일치] 프로필의 창업 아이템('{domain}' → {', '.join(profile_clusters)})과 상세 조건에 서술된 아이템 분야({', '.join(query_clusters)})가 서로 상충합니다."
+                )
+                questions.append(
+                    f"분석을 진행할 실제 창업 아이템이 프로필에 입력된 '{domain}'입니까, 아니면 상세 조건에 작성하신 '{', '.join(query_clusters)}' 관련 아이템입니까?"
+                )
+
+        return {"reasons": reasons, "questions": questions}
+
+    def _llm_based_conflict_check(
+        self, user_profile: Dict[str, str], user_query: str, mapped_persona: str
+    ) -> Dict[str, List[str]]:
+        if self.client is None:
+            return {"reasons": [], "questions": []}
+
+        try:
+            check_payload = (
+                f"[프로필 4대 항목]\n"
+                f"1. 현재 창업 단계(stage): {user_profile.get('stage')} (매핑 페르소나: {mapped_persona})\n"
+                f"2. 창업 아이템/기술 분야(domain): {user_profile.get('domain')}\n"
+                f"3. 거주지/사업장 지역(region): {user_profile.get('region')}\n"
+                f"4. 희망 지원 분야(category): {user_profile.get('category')}\n\n"
+                f"[수기 작성 상세 조건 프롬프트]\n"
+                f"{user_query}"
+            )
+            resp = self.client.chat.completions.create(
+                model=self.env_model,
+                messages=[
+                    {"role": "system", "content": self.CONFLICT_CHECK_SYSTEM_PROMPT},
+                    {"role": "user", "content": check_payload},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            content = resp.choices[0].message.content or "{}"
+            parsed = json.loads(content)
+            if parsed.get("has_conflict") is True:
+                return {
+                    "reasons": [str(r) for r in parsed.get("conflicts", []) if r],
+                    "questions": [str(q) for q in parsed.get("follow_up_questions", []) if q],
+                }
+        except Exception:
+            pass
+
+        return {"reasons": [], "questions": []}
+
+    def _check_input_ask_back(
+        self, user_profile: Dict[str, str], user_query: str, mapped_persona: str
+    ) -> Dict[str, Any]:
+        rule_res = self._rule_based_input_check(user_profile, user_query, mapped_persona)
+        reasons = list(rule_res["reasons"])
+        questions = list(rule_res["questions"])
+        rule_count = len(reasons)
+        llm_count = 0
+
+        if self.client is not None and len(user_query.strip()) >= 10:
+            llm_res = self._llm_based_conflict_check(user_profile, user_query, mapped_persona)
+            for r in llm_res["reasons"]:
+                if r not in reasons:
+                    reasons.append(r)
+                    llm_count += 1
+            for q in llm_res["questions"]:
+                if q not in questions:
+                    questions.append(q)
+
         return {
             "triggered": len(reasons) > 0,
+            "rule_conflicts_count": rule_count,
+            "llm_conflicts_count": llm_count,
             "reasons": reasons,
             "questions": questions,
             "persona_criteria": StartupTaxonomyGraphEngine.get_persona_criteria_info(mapped_persona),
@@ -145,37 +518,37 @@ class StartupPathfinderOrchestrator:
         need_category = user_profile.get("category", "전체")
         mapped_persona = StartupTaxonomyGraphEngine.map_stage_to_persona(stage)
 
-        # =====================================================================
-        # [사전 라우터 게이트] 입력 근거 부족 및 충돌 검증 -> 되묻기(Ask-back) 방식 1
-        # =====================================================================
         ask_back_check = self._check_input_ask_back(user_profile, user_query, mapped_persona)
         if ask_back_check["triggered"]:
             react_steps.append(
                 {
                     "step": 1,
-                    "phase": "Step 1. 입력 근거 무결성 및 페르소나 정합성 검증 (Ask-back 게이트)",
+                    "phase": "Step 1. 프로필 4대 항목 · 프롬프트 정합성 하이브리드 검증 (Ask-back 게이트)",
                     "thought": (
-                        f"사용자 프로필(단계: '{stage}' -> 매핑 페르소나: '{mapped_persona}', 아이템: '{domain}')과 "
-                        "상세 조건 텍스트의 정합성 및 근거 충분성을 검증한다."
+                        f"사용자 프로필(단계: '{stage}', 아이템: '{domain}', 지역: '{region}', 희망분야: '{need_category}')과 "
+                        "수기 작성 프롬프트 간의 정합성 및 근거 충분성을 규칙 엔진과 LLM으로 교차 검증한다."
                     ),
                     "action": {
-                        "tool": "input_evidence_validator",
+                        "tool": "hybrid_profile_prompt_validator",
                         "args": {
+                            "checked_fields": ["stage", "domain", "region", "category"],
                             "stage": stage,
-                            "mapped_persona": mapped_persona,
                             "domain": domain,
-                            "query_length": len(user_query.strip()),
+                            "region": region,
+                            "category": need_category,
                         },
                     },
                     "observation": {
                         "status": "ASK_BACK_REQUIRED",
                         "detected_issues_count": len(ask_back_check["reasons"]),
+                        "rule_conflicts_count": ask_back_check["rule_conflicts_count"],
+                        "llm_conflicts_count": ask_back_check["llm_conflicts_count"],
                         "persona_criteria": ask_back_check["persona_criteria"]["criteria_summary"],
                     },
                     "evidence": ask_back_check["reasons"],
                     "reflection": (
-                        "사용자 입력에서 근거 부족 또는 창업 단계(업력) 충돌이 감지되었다. "
-                        "부정확한 공고 추천을 중단(Abstention)하고, 페르소나별 적격 판단 기준 안내와 함께 사용자에게 명확한 정보 확인을 요청(Ask-back)한다."
+                        "프로필 설정값과 수기 작성 프롬프트 간에 불일치(충돌) 또는 근거 부족이 감지되었다. "
+                        "부정확한 공고 추천을 즉시 중단(Abstention)하고, 충돌 항목과 페르소나 적격 판단 기준을 제시하여 사용자에게 확인을 요청(Ask-back)한다."
                     ),
                 }
             )
@@ -189,12 +562,9 @@ class StartupPathfinderOrchestrator:
                 "crawl_status": self.mcp.last_crawl_status,
             }
 
-        # =====================================================================
-        # [ReAct Step 1] 데이터 무결성 및 GraphDB 택사노미 노드 검증
-        # =====================================================================
         thought_1 = (
-            f"사용자 프로필은 창업단계 '{stage}'(GraphDB 매핑 페르소나: '{mapped_persona}'), 아이템 '{domain}', "
-            f"지역 '{region}', 희망분야 '{need_category}'이다. 먼저 K-Startup 모집중 공고 인덱스와 GraphDB 지식그래프 상태를 점검한다."
+            f"프로필-프롬프트 정합성 검증을 통과했다(창업단계 '{stage}' -> 매핑 페르소나: '{mapped_persona}', 아이템 '{domain}', "
+            f"지역 '{region}', 희망분야 '{need_category}'). K-Startup 모집중 공고 인덱스와 GraphDB 지식그래프 상태를 점검한다."
         )
         if force_refresh_crawl or not self.mcp.rag_engine.is_indexed:
             action_1 = {
@@ -259,9 +629,6 @@ class StartupPathfinderOrchestrator:
             }
         )
 
-        # =====================================================================
-        # [ReAct Step 2] RAG 벡터 검색 + GraphDB 페르소나 경로 통합 탐색
-        # =====================================================================
         synthesized_query = f"{stage} {domain} {region} {need_category} {user_query}".strip()
         effective_filter = "전체" if target_cat_count == 0 else need_category
 
@@ -376,9 +743,6 @@ class StartupPathfinderOrchestrator:
             }
         )
 
-        # =====================================================================
-        # [ReAct Step 3] 페르소나 적격 판단 기준 교차 검증 및 최종 성찰
-        # =====================================================================
         thought_3 = (
             f"도출된 {len(matched_docs)}건의 후보 공고에 대해 '{mapped_persona}' 적격 판단 기준({persona_criteria['criteria_summary']})과 "
             f"사용자 지역('{region}')을 공고별 요건과 1:1 대조하여 부적격 리스크와 마감 임박도를 검증한다."
