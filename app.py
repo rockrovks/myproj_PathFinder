@@ -1,6 +1,7 @@
 import json
 import re
 from datetime import date
+from typing import List, Dict, Any, Tuple
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -15,9 +16,9 @@ st.set_page_config(
     layout="wide",
 )
 
-# 입력 안내 문구 숨김 + 상단 필터 박스 내 텍스트 '...' 잘림(ellipsis) 방지 CSS 최적화
-st.markdown(
-    """
+_DDAY_RE = re.compile(r"(\d+)")
+
+_CUSTOM_CSS = """
     <style>
     div[data-testid="InputInstructions"] {
         display: none !important;
@@ -47,19 +48,9 @@ st.markdown(
         text-overflow: clip !important;
     }
     </style>
-    """,
-    unsafe_allow_html=True,
-)
+    """
 
-
-def extract_dday_int(dday_str: str) -> int:
-    m = re.search(r"(\d+)", str(dday_str))
-    return int(m.group(1)) if m else 999
-
-
-def inject_ux_enhancements():
-    components.html(
-        """
+_UX_ENHANCEMENT_JS = """
         <script>
         (function() {
             const parentDoc = window.parent.document;
@@ -139,9 +130,110 @@ def inject_ux_enhancements():
             observer.observe(parentDoc.body, { childList: true, subtree: true });
         })();
         </script>
-        """,
-        height=0,
-    )
+        """
+
+_BASE_DISPLAY_COLS = [
+    "pbanc_sn_num",
+    "status",
+    "category",
+    "d_day_num",
+    "title",
+    "organization",
+    "target_stage",
+    "region",
+    "deadline",
+    "detail_url",
+]
+
+_HYBRID_DISPLAY_COLS = [
+    "pbanc_sn_num",
+    "match_score",
+    "matched_keywords",
+    "category",
+    "d_day_num",
+    "title",
+    "organization",
+    "target_stage",
+    "region",
+    "deadline",
+    "detail_url",
+]
+
+_EXPORT_DROP_COLS = [
+    "_parsed_deadline",
+    "_deadline_date",
+    "_search_text",
+    "_raw_match_score",
+    "pbanc_sn_num",
+    "d_day_num",
+]
+
+_GRAPH_RANK_DISPLAY_COLS = [
+    "persona",
+    "core_need",
+    "association_score",
+    "title",
+    "category",
+    "stage_fit",
+    "d_day",
+    "organization",
+    "matched_keywords",
+    "detail_url",
+]
+
+# 입력 안내 문구 숨김 + 상단 필터 박스 내 텍스트 '...' 잘림(ellipsis) 방지 CSS 최적화
+st.markdown(_CUSTOM_CSS, unsafe_allow_html=True)
+
+
+def extract_dday_int(dday_str: str) -> int:
+    m = _DDAY_RE.search(str(dday_str))
+    return int(m.group(1)) if m else 999
+
+
+def _parse_iso_date_safe(iso_str: Any) -> date | None:
+    if isinstance(iso_str, str) and iso_str:
+        try:
+            return date.fromisoformat(iso_str)
+        except ValueError:
+            return None
+    return None
+
+
+def get_prepared_base_dataframe(
+    crawled_data: List[Dict[str, Any]],
+) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    crawled_data로부터 기본 DataFrame과 파생 정렬/필터 컬럼(_deadline_date, pbanc_sn_num, d_day_num)을
+    1회 생성하여 세션에 캐싱합니다.
+    """
+    data_id = id(crawled_data)
+    cached = st.session_state.get("_prepared_df_cache")
+    if cached is not None and cached.get("data_id") == data_id:
+        return cached["df"], cached["categories"]
+
+    df = pd.DataFrame(crawled_data)
+    if not df.empty:
+        df["_deadline_date"] = [
+            _parse_iso_date_safe(x) for x in df["_parsed_deadline"]
+        ]
+        df["pbanc_sn_num"] = (
+            pd.to_numeric(df["pbanc_sn"], errors="coerce").fillna(0).astype(int)
+        )
+        df["d_day_num"] = [extract_dday_int(x) for x in df["d_day"]]
+        categories = ["전체"] + sorted(df["category"].unique().tolist())
+    else:
+        categories = ["전체"]
+
+    st.session_state["_prepared_df_cache"] = {
+        "data_id": data_id,
+        "df": df,
+        "categories": categories,
+    }
+    return df, categories
+
+
+def inject_ux_enhancements():
+    components.html(_UX_ENHANCEMENT_JS, height=0)
 
 
 # 세션 상태 초기화
@@ -185,6 +277,8 @@ with st.sidebar:
                 {},
             )
             st.session_state.crawled_data = st.session_state.rag_engine.documents
+            st.session_state.pop("_prepared_df_cache", None)
+            st.session_state.pop("_subgraph_render_cache", None)
             st.success(f"인덱싱 완료: {res['indexed_count']}건")
 
     st.divider()
@@ -219,7 +313,7 @@ tab_crawler, tab_agent, tab_mcp, tab_graph = st.tabs(
 with tab_crawler:
     st.subheader("K-Startup 모집중 사업공고 데이터")
 
-    df = pd.DataFrame(st.session_state.crawled_data)
+    df, categories = get_prepared_base_dataframe(st.session_state.crawled_data)
 
     # 텍스트가 '...'으로 잘리지 않도록 5개 필터 컬럼의 폭 비율 최적화
     col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns(
@@ -227,11 +321,6 @@ with tab_crawler:
     )
 
     with col_f1:
-        categories = (
-            ["전체"] + sorted(df["category"].unique().tolist())
-            if not df.empty
-            else ["전체"]
-        )
         selected_cat = st.selectbox("지원분야", categories)
 
     with col_f2:
@@ -258,10 +347,7 @@ with tab_crawler:
         )
 
     if not df.empty:
-        filtered_df = df.copy()
-        filtered_df["_deadline_date"] = filtered_df["_parsed_deadline"].apply(
-            lambda x: date.fromisoformat(x) if isinstance(x, str) and x else None
-        )
+        filtered_df = df
 
         # 1) 지원분야 필터
         if selected_cat != "전체":
@@ -302,14 +388,26 @@ with tab_crawler:
                 filtered_df = filtered_df[mask]
             else:
                 # 제목+내용 (규칙 엔진 + LLM 하이브리드 연관 확장 검색 모드)
+                base_records = filtered_df.drop(
+                    columns=["_deadline_date", "pbanc_sn_num", "d_day_num"],
+                    errors="ignore",
+                ).to_dict(orient="records")
                 hybrid_res = st.session_state.orchestrator.hybrid_table_search(
                     raw_query=kw_str,
-                    records=filtered_df.to_dict(orient="records"),
+                    records=base_records,
                 )
                 expanded_info = hybrid_res["expanded_info"]
                 matched_records = hybrid_res["matched_records"]
                 if matched_records:
                     filtered_df = pd.DataFrame(matched_records)
+                    filtered_df["pbanc_sn_num"] = (
+                        pd.to_numeric(filtered_df["pbanc_sn"], errors="coerce")
+                        .fillna(0)
+                        .astype(int)
+                    )
+                    filtered_df["d_day_num"] = [
+                        extract_dday_int(x) for x in filtered_df["d_day"]
+                    ]
                 else:
                     filtered_df = filtered_df.iloc[0:0].copy()
 
@@ -327,13 +425,9 @@ with tab_crawler:
                 f"LLM 의미 확장: `{', '.join(llm_kws) if llm_kws else '비활성(또는 추가 없음)'}`"
             )
 
-        # 컬럼 헤더 클릭 시 숫자/날짜/점수 오름·내림차순 정렬이 정확히 작동하도록 타입 정비
-        if not filtered_df.empty:
-            filtered_df["pbanc_sn_num"] = pd.to_numeric(
-                filtered_df["pbanc_sn"], errors="coerce"
-            ).fillna(0).astype(int)
-            filtered_df["d_day_num"] = filtered_df["d_day"].apply(extract_dday_int)
-        else:
+        # 빈 결과일 때 컬럼 보장
+        if filtered_df.empty:
+            filtered_df = filtered_df.copy()
             filtered_df["pbanc_sn_num"] = pd.Series(dtype="int64")
             filtered_df["d_day_num"] = pd.Series(dtype="int64")
 
@@ -341,36 +435,15 @@ with tab_crawler:
 
         if is_hybrid_mode and keyword_filter.strip():
             if "match_score" not in filtered_df.columns:
+                filtered_df = filtered_df.copy()
                 filtered_df["match_score"] = pd.Series(dtype="float64")
             if "matched_keywords" not in filtered_df.columns:
+                filtered_df = filtered_df.copy()
                 filtered_df["matched_keywords"] = pd.Series(dtype="object")
 
-            display_cols = [
-                "pbanc_sn_num",
-                "match_score",
-                "matched_keywords",
-                "category",
-                "d_day_num",
-                "title",
-                "organization",
-                "target_stage",
-                "region",
-                "deadline",
-                "detail_url",
-            ]
+            display_cols = _HYBRID_DISPLAY_COLS
         else:
-            display_cols = [
-                "pbanc_sn_num",
-                "status",
-                "category",
-                "d_day_num",
-                "title",
-                "organization",
-                "target_stage",
-                "region",
-                "deadline",
-                "detail_url",
-            ]
+            display_cols = _BASE_DISPLAY_COLS
 
         st.dataframe(
             filtered_df[display_cols],
@@ -395,14 +468,7 @@ with tab_crawler:
         )
 
         export_df = filtered_df.drop(
-            columns=[
-                "_parsed_deadline",
-                "_deadline_date",
-                "_search_text",
-                "_raw_match_score",
-                "pbanc_sn_num",
-                "d_day_num",
-            ],
+            columns=_EXPORT_DROP_COLS,
             errors="ignore",
         )
         dl_col1, dl_col2 = st.columns(2)
@@ -627,18 +693,38 @@ with tab_graph:
             f"**[적격 판단 기준 근거]:** {p_meta['criteria_summary']}"
         )
 
-    subgraph_data = st.session_state.graph_engine.query_persona_subgraph(
-        persona_name=selected_persona,
-        selected_need_name=selected_need,
-        min_score=min_assoc_score,
-        include_org_nodes=show_org_nodes,
+    graph_cache_key = (
+        selected_persona,
+        selected_need,
+        min_assoc_score,
+        show_org_nodes,
+        len(st.session_state.graph_engine.edges),
     )
+    cached_subgraph_render = st.session_state.get("_subgraph_render_cache")
+    if (
+        cached_subgraph_render is not None
+        and cached_subgraph_render.get("key") == graph_cache_key
+    ):
+        subgraph_data = cached_subgraph_render["subgraph_data"]
+        graph_html = cached_subgraph_render["graph_html"]
+    else:
+        subgraph_data = st.session_state.graph_engine.query_persona_subgraph(
+            persona_name=selected_persona,
+            selected_need_name=selected_need,
+            min_score=min_assoc_score,
+            include_org_nodes=show_org_nodes,
+        )
+        graph_html = StartupTaxonomyGraphEngine.render_interactive_graph_html(
+            nodes=subgraph_data["nodes"],
+            edges=subgraph_data["edges"],
+        )
+        st.session_state["_subgraph_render_cache"] = {
+            "key": graph_cache_key,
+            "subgraph_data": subgraph_data,
+            "graph_html": graph_html,
+        }
 
     st.markdown("#### 1. 페르소나 - 핵심과제 - 모집공고 연관도 네트워크")
-    graph_html = StartupTaxonomyGraphEngine.render_interactive_graph_html(
-        nodes=subgraph_data["nodes"],
-        edges=subgraph_data["edges"],
-    )
     components.html(graph_html, height=640)
 
     st.markdown("#### 2. 페르소나 맞춤형 그래프 탐색 공고 리스트")
@@ -646,20 +732,7 @@ with tab_graph:
     if ranked_list:
         rank_df = pd.DataFrame(ranked_list)
         st.dataframe(
-            rank_df[
-                [
-                    "persona",
-                    "core_need",
-                    "association_score",
-                    "title",
-                    "category",
-                    "stage_fit",
-                    "d_day",
-                    "organization",
-                    "matched_keywords",
-                    "detail_url",
-                ]
-            ],
+            rank_df[_GRAPH_RANK_DISPLAY_COLS],
             use_container_width=True,
             hide_index=True,
             column_config={

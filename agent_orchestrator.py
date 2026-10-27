@@ -2,8 +2,9 @@ import json
 import os
 import re
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 from dotenv import load_dotenv
+from crawler import KStartupOngoingCrawler
 from mcp_rag_engine import MCPServerRegistry
 from graph_db_engine import StartupTaxonomyGraphEngine
 
@@ -64,6 +65,41 @@ class StartupPathfinderOrchestrator:
   "expanded_keywords": ["연관키워드1", "연관키워드2", ...]
 }"""
 
+    _KEYWORD_SPLIT_RE = re.compile(r"[\s,·/]+")
+    _YEAR_SPAN_RE = re.compile(
+        r"(?:창업|설립|업력|개업)\s*(?:한\s*지\s*)?(\d+)\s*년|(\d+)\s*년\s*차"
+    )
+    _FOUNDING_YEAR_RE = re.compile(
+        r"(20[0-2]\d)\s*년\s*(?:에\s*)?(?:창업|설립|개업|법인)"
+    )
+
+    _PRE_STAGE_KEYWORDS: Tuple[str, ...] = (
+        "사업자등록 전",
+        "사업자 등록 전",
+        "미등록 예비",
+        "예비창업자입니다",
+        "예비 창업자입니다",
+        "예비창업팀입니다",
+        "창업 전입니다",
+    )
+    _REGISTERED_STAGE_KEYWORDS: Tuple[str, ...] = (
+        "법인 설립 완료",
+        "법인설립 완료",
+        "사업자등록 완료",
+        "사업자 등록 완료",
+        "기창업자입니다",
+        "법인사업자입니다",
+        "시리즈A",
+        "시리즈B",
+        "매출이 발생",
+    )
+    _DOYAK_PROGRAM_KEYWORDS: Tuple[str, ...] = (
+        "창업도약패키지",
+        "도약기 기업",
+        "스케일업 팁스",
+    )
+    _METRO_REGIONS: Tuple[str, ...] = ("서울", "경기", "인천")
+
     REGION_ALIASES: Dict[str, List[str]] = {
         "서울": ["서울", "마포", "공덕", "홍릉", "강남", "테헤란로", "성수", "여의도", "구로", "가산", "양재"],
         "경기": ["경기", "판교", "성남", "수원", "광교", "고양", "일산", "용인", "화성", "동탄", "안양", "부천", "시흥"],
@@ -96,6 +132,12 @@ class StartupPathfinderOrchestrator:
         "콘텐츠·미디어·에듀테크·커머스": ["콘텐츠", "웹툰", "게임", "영상", "미디어", "엔터테인먼트", "에듀테크", "교육용", "이커머스", "쇼핑몰", "패션", "뷰티"],
     }
 
+    _PERSONA_NEED_KEYWORDS_LOWER: Tuple[Tuple[str, ...], ...] = tuple(
+        tuple(k.lower() for k in need.get("keywords", []))
+        for p_data in StartupTaxonomyGraphEngine.PERSONA_TAXONOMY.values()
+        for need in p_data.get("core_needs", [])
+    )
+
     def __init__(self, mcp_server: MCPServerRegistry):
         self.mcp = mcp_server
         self.env_api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -106,6 +148,7 @@ class StartupPathfinderOrchestrator:
             else None
         )
         self._keyword_cache: Dict[str, Dict[str, List[str]]] = {}
+        self._conflict_check_cache: Dict[Tuple[str, str, str, str, str], Dict[str, List[str]]] = {}
 
     def has_valid_env_key(self) -> bool:
         return bool(self.env_api_key and not self.env_api_key.startswith("sk-proj-여기에"))
@@ -126,34 +169,42 @@ class StartupPathfinderOrchestrator:
             return self._keyword_cache[q_clean]
 
         q_lower = q_clean.lower()
-        base_terms = [t.strip() for t in re.split(r"[\s,·/]+", q_lower) if len(t.strip()) >= 2]
+        base_terms = [
+            t.strip()
+            for t in self._KEYWORD_SPLIT_RE.split(q_lower)
+            if len(t.strip()) >= 2
+        ]
         if not base_terms:
             base_terms = [q_lower]
 
+        seen_rule = set(base_terms)
         rule_expanded: List[str] = []
 
         # 1) 도메인 클러스터 유의어 확장
-        for _, cluster_kws in self.DOMAIN_CLUSTERS.items():
+        for cluster_kws in self.DOMAIN_CLUSTERS.values():
             if any(bt in kw or kw in q_lower for bt in base_terms for kw in cluster_kws):
                 for kw in cluster_kws:
-                    if kw not in base_terms and kw not in rule_expanded:
+                    if kw not in seen_rule:
+                        seen_rule.add(kw)
                         rule_expanded.append(kw)
 
         # 2) 지원분야 의도 키워드 확장
         for cat_name, cat_kws in self.CATEGORY_INTENT_KEYWORDS.items():
-            if cat_name.lower() in q_lower or any(bt in kw or kw in q_lower for bt in base_terms for kw in cat_kws):
+            if cat_name.lower() in q_lower or any(
+                bt in kw or kw in q_lower for bt in base_terms for kw in cat_kws
+            ):
                 for kw in cat_kws:
-                    if kw not in base_terms and kw not in rule_expanded:
+                    if kw not in seen_rule:
+                        seen_rule.add(kw)
                         rule_expanded.append(kw)
 
         # 3) 페르소나 핵심 성장 과제 키워드 확장
-        for _, p_data in StartupTaxonomyGraphEngine.PERSONA_TAXONOMY.items():
-            for need in p_data.get("core_needs", []):
-                need_kws = [k.lower() for k in need.get("keywords", [])]
-                if any(bt in nk or nk in q_lower for bt in base_terms for nk in need_kws):
-                    for nk in need_kws:
-                        if nk not in base_terms and nk not in rule_expanded:
-                            rule_expanded.append(nk)
+        for need_kws in self._PERSONA_NEED_KEYWORDS_LOWER:
+            if any(bt in nk or nk in q_lower for bt in base_terms for nk in need_kws):
+                for nk in need_kws:
+                    if nk not in seen_rule:
+                        seen_rule.add(nk)
+                        rule_expanded.append(nk)
 
         rule_expanded = rule_expanded[:10]
 
@@ -171,9 +222,11 @@ class StartupPathfinderOrchestrator:
                     temperature=0.1,
                 )
                 parsed = json.loads(resp.choices[0].message.content or "{}")
+                seen_llm = set(base_terms) | set(rule_expanded)
                 for kw in parsed.get("expanded_keywords", []):
                     kw_l = str(kw).strip().lower()
-                    if len(kw_l) >= 2 and kw_l not in base_terms and kw_l not in rule_expanded and kw_l not in llm_expanded:
+                    if len(kw_l) >= 2 and kw_l not in seen_llm:
+                        seen_llm.add(kw_l)
                         llm_expanded.append(kw_l)
                 llm_expanded = llm_expanded[:8]
             except Exception:
@@ -198,18 +251,14 @@ class StartupPathfinderOrchestrator:
         """
         expanded_info = self.expand_search_keywords(raw_query)
         base_terms = expanded_info["base_terms"]
-        rule_terms = expanded_info["rule_expanded"]
-        llm_terms = expanded_info["llm_expanded"]
+        expanded_terms = expanded_info["rule_expanded"] + expanded_info["llm_expanded"]
 
         matched_records: List[Dict[str, Any]] = []
         raw_scores: List[float] = []
 
         for rec in records:
             title_l = rec.get("title", "").lower()
-            full_l = rec.get("_search_text") or (
-                f"{title_l} {rec.get('category', '')} {rec.get('organization', '')} "
-                f"{rec.get('target_stage', '')} {rec.get('region', '')} {rec.get('summary', '')}"
-            ).lower()
+            full_l = rec.get("_search_text") or KStartupOngoingCrawler.build_search_text(rec)
 
             score = 0.0
             hit_keywords: List[str] = []
@@ -223,30 +272,22 @@ class StartupPathfinderOrchestrator:
                     score += 26.0
                     hit_keywords.append(bt)
 
-            # 규칙 확장 키워드 매칭 (중간 가중치)
-            for rt in rule_terms:
-                if rt in title_l:
+            # 규칙 + LLM 확장 키워드 매칭 (동일 가중치 통합 루프)
+            for et in expanded_terms:
+                if et in title_l:
                     score += 14.0
-                    hit_keywords.append(rt)
-                elif rt in full_l:
+                    hit_keywords.append(et)
+                elif et in full_l:
                     score += 9.0
-                    hit_keywords.append(rt)
-
-            # LLM 확장 키워드 매칭 (보조 가중치)
-            for lt in llm_terms:
-                if lt in title_l:
-                    score += 14.0
-                    hit_keywords.append(lt)
-                elif lt in full_l:
-                    score += 9.0
-                    hit_keywords.append(lt)
+                    hit_keywords.append(et)
 
             if score > 0.0:
+                capped_score = min(score, 100.0)
                 rec_copy = dict(rec)
-                rec_copy["_raw_match_score"] = min(score, 100.0)
+                rec_copy["_raw_match_score"] = capped_score
                 rec_copy["matched_keywords"] = ", ".join(list(dict.fromkeys(hit_keywords))[:6])
                 matched_records.append(rec_copy)
-                raw_scores.append(min(score, 100.0))
+                raw_scores.append(capped_score)
 
         if matched_records:
             scaled = StartupTaxonomyGraphEngine.scale_scores_distribution(
@@ -292,28 +333,21 @@ class StartupPathfinderOrchestrator:
         current_year = datetime.now().year
         year_spans = [
             int(y)
-            for grp in re.findall(
-                r"(?:창업|설립|업력|개업)\s*(?:한\s*지\s*)?(\d+)\s*년|(\d+)\s*년\s*차",
-                query_clean,
-            )
+            for grp in self._YEAR_SPAN_RE.findall(query_clean)
             for y in grp
             if y
         ]
         founding_years = [
             int(fy)
-            for fy in re.findall(r"(20[0-2]\d)\s*년\s*(?:에\s*)?(?:창업|설립|개업|법인)", query_clean)
+            for fy in self._FOUNDING_YEAR_RE.findall(query_clean)
         ]
         for fy in founding_years:
             if 2000 <= fy <= current_year:
                 year_spans.append(max(current_year - fy, 1))
 
-        has_pre_kw = any(
-            kw in query_clean
-            for kw in ["사업자등록 전", "사업자 등록 전", "미등록 예비", "예비창업자입니다", "예비 창업자입니다", "예비창업팀입니다", "창업 전입니다"]
-        )
+        has_pre_kw = any(kw in query_clean for kw in self._PRE_STAGE_KEYWORDS)
         has_registered_kw = any(
-            kw in query_clean
-            for kw in ["법인 설립 완료", "법인설립 완료", "사업자등록 완료", "사업자 등록 완료", "기창업자입니다", "법인사업자입니다", "시리즈A", "시리즈B", "매출이 발생"]
+            kw in query_clean for kw in self._REGISTERED_STAGE_KEYWORDS
         )
 
         if mapped_persona == "예비창업자":
@@ -325,7 +359,7 @@ class StartupPathfinderOrchestrator:
                 questions.append(
                     "현재 사업자등록증(개인 또는 법인)을 이미 발급받으신 기창업 상태입니까, 아니면 사업자등록 이전인 예비창업 상태입니까?"
                 )
-            elif any(kw in query_clean for kw in ["창업도약패키지", "도약기 기업", "스케일업 팁스"]):
+            elif any(kw in query_clean for kw in self._DOYAK_PROGRAM_KEYWORDS):
                 reasons.append(
                     f"[창업 단계 불일치] 프로필 단계는 '{stage}'이나, 상세 조건에서는 기창업 도약기(3~7년) 전용 사업을 요청하고 있습니다."
                 )
@@ -375,7 +409,7 @@ class StartupPathfinderOrchestrator:
 
             if detected_regions:
                 if region == "비수도권/로컬":
-                    metro_hits = [r for r in detected_regions if r in ("서울", "경기", "인천")]
+                    metro_hits = [r for r in detected_regions if r in self._METRO_REGIONS]
                     if metro_hits:
                         reasons.append(
                             f"[지역 조건 불일치] 프로필 지역은 '{region}'로 선택되었으나, 상세 조건에는 수도권 지역({', '.join(metro_hits)})이 명시되어 있습니다."
@@ -445,6 +479,17 @@ class StartupPathfinderOrchestrator:
         if self.client is None:
             return {"reasons": [], "questions": []}
 
+        cache_key = (
+            user_profile.get("stage", ""),
+            user_profile.get("domain", ""),
+            user_profile.get("region", ""),
+            user_profile.get("category", ""),
+            user_query.strip(),
+        )
+        if cache_key in self._conflict_check_cache:
+            return self._conflict_check_cache[cache_key]
+
+        result: Dict[str, List[str]] = {"reasons": [], "questions": []}
         try:
             check_payload = (
                 f"[프로필 4대 항목]\n"
@@ -467,14 +512,15 @@ class StartupPathfinderOrchestrator:
             content = resp.choices[0].message.content or "{}"
             parsed = json.loads(content)
             if parsed.get("has_conflict") is True:
-                return {
+                result = {
                     "reasons": [str(r) for r in parsed.get("conflicts", []) if r],
                     "questions": [str(q) for q in parsed.get("follow_up_questions", []) if q],
                 }
+            self._conflict_check_cache[cache_key] = result
         except Exception:
             pass
 
-        return {"reasons": [], "questions": []}
+        return result
 
     def _check_input_ask_back(
         self, user_profile: Dict[str, str], user_query: str, mapped_persona: str

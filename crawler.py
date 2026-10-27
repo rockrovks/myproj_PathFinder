@@ -12,16 +12,35 @@ class KStartupOngoingCrawler:
     - 로드 시점에 검색용 통합 텍스트(_search_text)와 마감일(_parsed_deadline)을 사전 연산합니다.
     """
 
+    _FULL_DATE_PATTERN = re.compile(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})")
+    _SHORT_DATE_PATTERN = re.compile(r"(\d{1,2})[-./](\d{1,2})")
+    _SEARCH_TEXT_FIELDS: Tuple[str, ...] = (
+        "title",
+        "category",
+        "organization",
+        "target_stage",
+        "region",
+        "summary",
+    )
+
     def __init__(self, json_filename: str = "mock_data.json"):
         self.data_path = Path(__file__).resolve().parent / json_filename
 
-    @staticmethod
-    def parse_deadline_to_iso(deadline_str: str) -> Optional[str]:
+    @classmethod
+    def build_search_text(cls, record: Dict[str, Any]) -> str:
+        return " ".join(
+            str(record.get(field, "")) for field in cls._SEARCH_TEXT_FIELDS
+        ).lower()
+
+    @classmethod
+    def parse_deadline_to_iso(
+        cls, deadline_str: str, default_year: Optional[int] = None
+    ) -> Optional[str]:
         if not deadline_str:
             return None
         text = str(deadline_str)
 
-        full_match = re.search(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", text)
+        full_match = cls._FULL_DATE_PATTERN.search(text)
         if full_match:
             try:
                 return date(
@@ -32,11 +51,12 @@ class KStartupOngoingCrawler:
             except ValueError:
                 return None
 
-        short_match = re.search(r"(\d{1,2})[-./](\d{1,2})", text)
+        short_match = cls._SHORT_DATE_PATTERN.search(text)
         if short_match:
             try:
+                year = default_year if default_year is not None else datetime.now().year
                 return date(
-                    datetime.now().year,
+                    year,
                     int(short_match.group(1)),
                     int(short_match.group(2)),
                 ).isoformat()
@@ -51,23 +71,18 @@ class KStartupOngoingCrawler:
 
         try:
             with open(self.data_path, "r", encoding="utf-8") as f:
-                raw_data: List[Dict[str, Any]] = json.load(f)
+                announcements: List[Dict[str, Any]] = json.load(f)
 
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            announcements: List[Dict[str, Any]] = []
+            now = datetime.now()
+            now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+            current_year = now.year
 
-            for item in raw_data:
-                record = dict(item)
+            for record in announcements:
                 record.setdefault("crawled_at", now_str)
                 record["_parsed_deadline"] = self.parse_deadline_to_iso(
-                    record.get("deadline", "")
+                    record.get("deadline", ""), default_year=current_year
                 )
-                record["_search_text"] = (
-                    f"{record.get('title', '')} {record.get('category', '')} "
-                    f"{record.get('organization', '')} {record.get('target_stage', '')} "
-                    f"{record.get('region', '')} {record.get('summary', '')}"
-                ).lower()
-                announcements.append(record)
+                record["_search_text"] = self.build_search_text(record)
 
             return (
                 announcements,

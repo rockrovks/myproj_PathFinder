@@ -1,7 +1,7 @@
 import json
 import math
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -131,15 +131,100 @@ class StartupTaxonomyGraphEngine:
         },
     }
 
+    _NON_METRO_REGIONS: Tuple[str, ...] = (
+        "비수도권",
+        "부산",
+        "대전",
+        "대구",
+        "광주",
+        "강원",
+        "충북",
+        "충남",
+        "전북",
+        "전남",
+        "경북",
+        "경남",
+        "제주",
+    )
+
+    _DEFAULT_CATEGORIES: Tuple[str, ...] = (
+        "사업화",
+        "기술개발(R&D)",
+        "시설ㆍ공간ㆍ보육",
+        "멘토링ㆍ컨설팅ㆍ교육",
+        "판로ㆍ해외진출",
+    )
+
+    _NODE_COLOR_PALETTE: Dict[str, Dict[str, Any]] = {
+        "Persona": {
+            "bg": "#DC2626",
+            "border": "#7F1D1D",
+            "font": "#FFFFFF",
+            "shape": "box",
+            "col_x": -520,
+        },
+        "CoreNeed": {
+            "bg": "#F59E0B",
+            "border": "#92400E",
+            "font": "#111827",
+            "shape": "box",
+            "col_x": -190,
+        },
+        "Announcement": {
+            "bg": "#059669",
+            "border": "#064E3B",
+            "font": "#FFFFFF",
+            "shape": "box",
+            "col_x": 190,
+        },
+        "SupportCategory": {
+            "bg": "#7C3AED",
+            "border": "#4C1D95",
+            "font": "#FFFFFF",
+            "shape": "ellipse",
+            "col_x": 540,
+        },
+        "Organization": {
+            "bg": "#334155",
+            "border": "#0F172A",
+            "font": "#FFFFFF",
+            "shape": "box",
+            "col_x": 540,
+        },
+    }
+
+    # 페르소나별 핵심과제 카테고리 집합(frozenset) 및 (원본 키워드, 소문자 키워드) 튜플 사전 연산 캐시
+    _PREPARED_CORE_NEEDS: Dict[str, Tuple[Dict[str, Any], ...]] = {
+        p_label: tuple(
+            {
+                "id": need["id"],
+                "name": need["name"],
+                "weight": need["weight"],
+                "category_set": frozenset(need["categories"]),
+                "kw_pairs": tuple((kw, kw.lower()) for kw in need["keywords"]),
+            }
+            for need in p_info["core_needs"]
+        )
+        for p_label, p_info in PERSONA_TAXONOMY.items()
+    }
+
     def __init__(self):
         self.nodes: Dict[str, Dict[str, Any]] = {}
         self.edges: List[Dict[str, Any]] = []
+        self._edges_by_relation: Dict[str, List[Dict[str, Any]]] = {}
         self.announcements: List[Dict[str, Any]] = []
 
         self.neo4j_uri = os.getenv("NEO4J_URI", "").strip()
         self.neo4j_user = os.getenv("NEO4J_USER", "").strip()
         self.neo4j_password = os.getenv("NEO4J_PASSWORD", "").strip()
         self.neo4j_synced = False
+
+    def _add_edge(self, edge: Dict[str, Any]) -> None:
+        self.edges.append(edge)
+        rel = edge.get("relation", "")
+        if rel not in self._edges_by_relation:
+            self._edges_by_relation[rel] = []
+        self._edges_by_relation[rel].append(edge)
 
     @staticmethod
     def map_stage_to_persona(user_stage: str) -> str:
@@ -258,7 +343,7 @@ class StartupTaxonomyGraphEngine:
         elif "전국" in doc_region:
             region_score = 0.12
             region_verdict = f"적합 (전국 단위 모집 공고: {doc_region})"
-        elif "비수도권" in user_region and any(k in doc_region for k in ["비수도권", "부산", "대전", "대구", "광주", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주"]):
+        elif "비수도권" in user_region and any(k in doc_region for k in cls._NON_METRO_REGIONS):
             region_score = 0.14
             region_verdict = f"적합 (비수도권/로컬 우대 및 지역 부합: {doc_region})"
         else:
@@ -299,9 +384,10 @@ class StartupTaxonomyGraphEngine:
            - 그룹 내 상위 3~4개(top_target_count)만 최상위 구간(0.80 ~ 0.94)에 배치
            - 대다수 중위권 공고는 0.35 ~ 0.78 구간에 고르게 분포, 극단적 저득점(<0.30)도 소수로 억제
         """
+        total_len = len(raw_scores_100)
         valid_indices = [i for i, r in enumerate(raw_scores_100) if r > 12.0]
         if not valid_indices:
-            return [0.0 for _ in raw_scores_100]
+            return [0.0] * total_len
 
         # 1단계: 20점 단위 비선형 지수 도약
         step_up_vals = [
@@ -314,7 +400,7 @@ class StartupTaxonomyGraphEngine:
                 round(min(max(raw_scores_100[i] / 100.0, 0.20), 0.92), 2)
                 if raw_scores_100[i] > 12.0
                 else 0.0
-                for i in range(len(raw_scores_100))
+                for i in range(total_len)
             ]
 
         # 2단계: IQR 사분위수 기반 이상치 보정 (Winsorizing)
@@ -336,26 +422,25 @@ class StartupTaxonomyGraphEngine:
                 winsorized.append(v)
 
         # 3단계: Z-Score 표준화 및 로지스틱(Sigmoid) 스케일링
-        mean_w = sum(winsorized) / len(winsorized)
-        var_w = sum((w - mean_w) ** 2 for w in winsorized) / len(winsorized)
+        n_valid = len(winsorized)
+        mean_w = sum(winsorized) / n_valid
+        var_w = sum((w - mean_w) ** 2 for w in winsorized) / n_valid
         std_w = max(math.sqrt(var_w), 1e-4)
 
         z_scores = [(w - mean_w) / std_w for w in winsorized]
-        sorted_z_desc = sorted(z_scores, reverse=True)
-        n_valid = len(sorted_z_desc)
-
-        z_med = cls._percentile(sorted(z_scores), 0.50)
+        sorted_z_asc = sorted(z_scores)
+        z_med = cls._percentile(sorted_z_asc, 0.50)
 
         # 상위 top_target_count(기본 4개, 즉 3~4개)가 >= 0.80에 안착하도록 경계 Z값 산출
         if n_valid > top_target_count:
-            z_top_border = sorted_z_desc[top_target_count - 1]
-            z_next = sorted_z_desc[top_target_count]
+            z_top_border = sorted_z_asc[n_valid - top_target_count]
+            z_next = sorted_z_asc[n_valid - top_target_count - 1]
             if z_top_border > z_next:
                 z_cut = (z_top_border + z_next) / 2.0
             else:
                 z_cut = z_top_border + 0.02
         else:
-            z_cut = sorted_z_desc[0] + 0.20
+            z_cut = sorted_z_asc[-1] + 0.20
 
         # 로지스틱 곡선(0.20 ~ 0.94)에서 0.80에 도달하는 로짓(Log-odds) 값:
         # (0.80 - 0.20) / (0.94 - 0.20) = 0.60 / 0.74 = 0.8108 -> ln(0.8108 / 0.1892) = 1.4553
@@ -364,7 +449,7 @@ class StartupTaxonomyGraphEngine:
         alpha_upper = u_target_080 / upper_span
         alpha_lower = 1.15  # 하위권 완만한 감쇠로 극단적 저득점(<0.30) 비율 최소화
 
-        scaled_map: Dict[int, float] = {}
+        result = [0.0] * total_len
         for idx_in_valid, orig_idx in enumerate(valid_indices):
             z = z_scores[idx_in_valid]
             if z >= z_med:
@@ -375,9 +460,9 @@ class StartupTaxonomyGraphEngine:
             u_clamped = min(max(u, -4.0), 4.0)
             logistic_val = 1.0 / (1.0 + math.exp(-u_clamped))
             final_val = 0.20 + logistic_val * 0.74  # 범위: 0.20 ~ 0.94
-            scaled_map[orig_idx] = round(final_val, 2)
+            result[orig_idx] = round(final_val, 2)
 
-        return [scaled_map.get(i, 0.0) for i in range(len(raw_scores_100))]
+        return result
 
     @classmethod
     def stretch_score_contrast(cls, raw_score: float) -> float:
@@ -390,12 +475,12 @@ class StartupTaxonomyGraphEngine:
     def build_knowledge_graph(self, announcements: List[Dict[str, Any]]) -> Dict[str, int]:
         self.nodes.clear()
         self.edges.clear()
+        self._edges_by_relation.clear()
         self.announcements = announcements
 
-        categories = set(
-            ["사업화", "기술개발(R&D)", "시설ㆍ공간ㆍ보육", "멘토링ㆍ컨설팅ㆍ교육", "판로ㆍ해외진출"]
-            + [a.get("category", "사업화") for a in announcements]
-        )
+        categories = set(self._DEFAULT_CATEGORIES) | {
+            a.get("category", "사업화") for a in announcements
+        }
         for cat in sorted(categories):
             cat_id = f"CAT_{cat}"
             self.nodes[cat_id] = {
@@ -431,7 +516,7 @@ class StartupTaxonomyGraphEngine:
                         "priority_weight": need["weight"],
                     },
                 }
-                self.edges.append(
+                self._add_edge(
                     {
                         "source": p_id,
                         "target": n_id,
@@ -444,7 +529,7 @@ class StartupTaxonomyGraphEngine:
                 for mapped_cat in need["categories"]:
                     cat_id = f"CAT_{mapped_cat}"
                     if cat_id in self.nodes:
-                        self.edges.append(
+                        self._add_edge(
                             {
                                 "source": n_id,
                                 "target": cat_id,
@@ -454,10 +539,12 @@ class StartupTaxonomyGraphEngine:
                             }
                         )
 
+        ann_titles_lower: List[str] = []
         for ann in announcements:
             sn = str(ann.get("pbanc_sn", ""))
             ann_id = f"ANN_{sn}"
             title = ann.get("title", "")
+            ann_titles_lower.append(title.lower())
             cat = ann.get("category", "사업화")
             org = ann.get("organization", "창업진흥원")
             target_stage = ann.get("target_stage", "")
@@ -483,7 +570,7 @@ class StartupTaxonomyGraphEngine:
 
             cat_id = f"CAT_{cat}"
             if cat_id in self.nodes:
-                self.edges.append(
+                self._add_edge(
                     {
                         "source": ann_id,
                         "target": cat_id,
@@ -501,7 +588,7 @@ class StartupTaxonomyGraphEngine:
                     "type": "Organization",
                     "properties": {"name": org, "role": "공고 주관/수행기관"},
                 }
-            self.edges.append(
+            self._add_edge(
                 {
                     "source": ann_id,
                     "target": org_id,
@@ -513,11 +600,13 @@ class StartupTaxonomyGraphEngine:
 
         # [방식 1 적용] 페르소나별 독립 스케일링 (페르소나당 상위 3~4개만 >= 0.80 배정)
         for p_name, p_data in self.PERSONA_TAXONOMY.items():
-            raw_assoc_list: List[Dict[str, Any]] = []
+            raw_assoc_list: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
             raw_scores_100: List[float] = []
 
-            for ann in announcements:
-                assoc_info = self._calculate_persona_announcement_association(p_data, ann)
+            for ann, title_lower in zip(announcements, ann_titles_lower):
+                assoc_info = self._calculate_persona_announcement_association(
+                    p_data, ann, title_lower=title_lower
+                )
                 raw_assoc_list.append((ann, assoc_info))
                 raw_scores_100.append(assoc_info["raw_score_100"])
 
@@ -530,7 +619,7 @@ class StartupTaxonomyGraphEngine:
                 if final_score >= 0.18 and assoc_info["best_need_id"]:
                     sn = str(ann.get("pbanc_sn", ""))
                     ann_id = f"ANN_{sn}"
-                    self.edges.append(
+                    self._add_edge(
                         {
                             "source": assoc_info["best_need_id"],
                             "target": ann_id,
@@ -553,7 +642,10 @@ class StartupTaxonomyGraphEngine:
         return {"nodes_count": len(self.nodes), "edges_count": len(self.edges)}
 
     def _calculate_persona_announcement_association(
-        self, p_data: Dict[str, Any], ann: Dict[str, Any]
+        self,
+        p_data: Dict[str, Any],
+        ann: Dict[str, Any],
+        title_lower: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         100점 만점 정밀 원점수(raw_score_100) 산출:
@@ -578,36 +670,63 @@ class StartupTaxonomyGraphEngine:
             }
 
         cat = ann.get("category", "")
-        title_lower = ann.get("title", "").lower()
-        summary_lower = ann.get("summary", "").lower()
-        full_text = ann.get("_search_text") or f"{title_lower} {summary_lower} {cat.lower()}"
+        if title_lower is None:
+            title_lower = ann.get("title", "").lower()
+        full_text = ann.get("_search_text")
+        if not full_text:
+            summary_lower = ann.get("summary", "").lower()
+            full_text = f"{title_lower} {summary_lower} {cat.lower()}"
 
+        prepared_needs = self._PREPARED_CORE_NEEDS.get(p_label)
         need_evals = []
-        for need in p_data["core_needs"]:
-            # 지원분야 일치 기본점수 완화로 단순 카테고리 일치만으로 고득점이 되는 현상 방지
-            cat_pts = 16.0 if cat in need["categories"] else 3.0
 
-            matched_kw = []
-            kw_pts = 0.0
-            for kw in need["keywords"]:
-                kw_l = kw.lower()
-                if kw_l in title_lower:
-                    matched_kw.append(kw)
-                    kw_pts += 9.5  # 공고 제목에 핵심 키워드 직접 명시 시 높은 가중치
-                elif kw_l in full_text:
-                    matched_kw.append(kw)
-                    kw_pts += 5.5  # 요약문 등에 포함 시 일반 가중치
+        if prepared_needs is not None:
+            for need in prepared_needs:
+                cat_pts = 16.0 if cat in need["category_set"] else 3.0
+                matched_kw = []
+                kw_pts = 0.0
+                for kw_orig, kw_l in need["kw_pairs"]:
+                    if kw_l in title_lower:
+                        matched_kw.append(kw_orig)
+                        kw_pts += 9.5
+                    elif kw_l in full_text:
+                        matched_kw.append(kw_orig)
+                        kw_pts += 5.5
 
-            kw_pts = min(kw_pts, 39.0)
-            weighted_need_pts = (cat_pts + kw_pts) * need["weight"]
-            need_evals.append(
-                {
-                    "need_id": need["id"],
-                    "need_name": need["name"],
-                    "score": weighted_need_pts,
-                    "keywords": matched_kw,
-                }
-            )
+                kw_pts = min(kw_pts, 39.0)
+                weighted_need_pts = (cat_pts + kw_pts) * need["weight"]
+                need_evals.append(
+                    {
+                        "need_id": need["id"],
+                        "need_name": need["name"],
+                        "score": weighted_need_pts,
+                        "keywords": matched_kw,
+                    }
+                )
+        else:
+            for need in p_data["core_needs"]:
+                cat_pts = 16.0 if cat in need["categories"] else 3.0
+                matched_kw = []
+                kw_pts = 0.0
+                for kw in need["keywords"]:
+                    kw_l = kw.lower()
+                    if kw_l in title_lower:
+                        matched_kw.append(kw)
+                        kw_pts += 9.5
+                    elif kw_l in full_text:
+                        matched_kw.append(kw)
+                        kw_pts += 5.5
+
+                kw_pts = min(kw_pts, 39.0)
+                weighted_need_pts = (cat_pts + kw_pts) * need["weight"]
+                need_evals.append(
+                    {
+                        "need_id": need["id"],
+                        "need_name": need["name"],
+                        "score": weighted_need_pts,
+                        "keywords": matched_kw,
+                    }
+                )
 
         need_evals.sort(key=lambda x: x["score"], reverse=True)
         best = need_evals[0]
@@ -655,9 +774,36 @@ class StartupTaxonomyGraphEngine:
         vis_edges: List[Dict[str, Any]] = []
         ranked_announcements: List[Dict[str, Any]] = []
 
+        use_indexed_edges = bool(self._edges_by_relation)
+        has_need_edges = (
+            self._edges_by_relation.get("HAS_NEED", ())
+            if use_indexed_edges
+            else (e for e in self.edges if e["relation"] == "HAS_NEED")
+        )
+        resolved_by_edges = (
+            self._edges_by_relation.get("RESOLVED_BY", ())
+            if use_indexed_edges
+            else (e for e in self.edges if e["relation"] == "RESOLVED_BY")
+        )
+        belongs_to_edges = (
+            self._edges_by_relation.get("BELONGS_TO", ())
+            if use_indexed_edges
+            else (e for e in self.edges if e["relation"] == "BELONGS_TO")
+        )
+        mapped_to_cat_edges = (
+            self._edges_by_relation.get("MAPPED_TO_CATEGORY", ())
+            if use_indexed_edges
+            else (e for e in self.edges if e["relation"] == "MAPPED_TO_CATEGORY")
+        )
+        hosted_by_edges = (
+            self._edges_by_relation.get("HOSTED_BY", ())
+            if use_indexed_edges
+            else (e for e in self.edges if e["relation"] == "HOSTED_BY")
+        )
+
         allowed_need_ids = set()
-        for edge in self.edges:
-            if edge["relation"] == "HAS_NEED" and edge["source"] in persona_ids:
+        for edge in has_need_edges:
+            if edge["source"] in persona_ids:
                 need_node = self.nodes.get(edge["target"], {})
                 if selected_need_name != "전체" and need_node.get("label") != selected_need_name:
                     continue
@@ -668,12 +814,8 @@ class StartupTaxonomyGraphEngine:
         matched_ann_ids = set()
         ann_max_score: Dict[str, float] = {}
 
-        for edge in self.edges:
-            if (
-                edge["relation"] == "RESOLVED_BY"
-                and edge["source"] in allowed_need_ids
-                and edge["weight"] >= min_score
-            ):
+        for edge in resolved_by_edges:
+            if edge["source"] in allowed_need_ids and edge["weight"] >= min_score:
                 ann_id = edge["target"]
                 matched_ann_ids.add(ann_id)
                 active_node_ids.add(ann_id)
@@ -705,23 +847,19 @@ class StartupTaxonomyGraphEngine:
                 )
 
         active_cat_ids = set()
-        for edge in self.edges:
-            if edge["relation"] == "BELONGS_TO" and edge["source"] in matched_ann_ids:
+        for edge in belongs_to_edges:
+            if edge["source"] in matched_ann_ids:
                 active_cat_ids.add(edge["target"])
                 active_node_ids.add(edge["target"])
                 vis_edges.append(edge)
 
-        for edge in self.edges:
-            if (
-                edge["relation"] == "MAPPED_TO_CATEGORY"
-                and edge["source"] in allowed_need_ids
-                and edge["target"] in active_cat_ids
-            ):
+        for edge in mapped_to_cat_edges:
+            if edge["source"] in allowed_need_ids and edge["target"] in active_cat_ids:
                 vis_edges.append(edge)
 
         if include_org_nodes:
-            for edge in self.edges:
-                if edge["relation"] == "HOSTED_BY" and edge["source"] in matched_ann_ids:
+            for edge in hosted_by_edges:
+                if edge["source"] in matched_ann_ids:
                     active_node_ids.add(edge["target"])
                     vis_edges.append(edge)
 
@@ -758,32 +896,31 @@ class StartupTaxonomyGraphEngine:
 
     def _sync_to_neo4j(self) -> None:
         try:
-            driver = GraphDatabase.driver(
+            with GraphDatabase.driver(
                 self.neo4j_uri, auth=(self.neo4j_user, self.neo4j_password)
-            )
-            with driver.session() as session:
-                session.run("MATCH (n) DETACH DELETE n")
-                for node in self.nodes.values():
-                    label = node["type"]
-                    props = dict(node.get("properties", {}))
-                    props["id"] = node["id"]
-                    props["label"] = node["label"]
-                    session.run(
-                        f"MERGE (n:{label} {{id: $id}}) SET n += $props",
-                        id=node["id"],
-                        props=props,
-                    )
-                for edge in self.edges:
-                    rel = edge["relation"]
-                    session.run(
-                        f"MATCH (a {{id: $src}}), (b {{id: $dst}}) "
-                        f"MERGE (a)-[r:{rel}]->(b) SET r.weight = $w, r.label = $lbl",
-                        src=edge["source"],
-                        dst=edge["target"],
-                        w=edge.get("weight", 0.5),
-                        lbl=edge.get("label", ""),
-                    )
-            driver.close()
+            ) as driver:
+                with driver.session() as session:
+                    session.run("MATCH (n) DETACH DELETE n")
+                    for node in self.nodes.values():
+                        label = node["type"]
+                        props = dict(node.get("properties", {}))
+                        props["id"] = node["id"]
+                        props["label"] = node["label"]
+                        session.run(
+                            f"MERGE (n:{label} {{id: $id}}) SET n += $props",
+                            id=node["id"],
+                            props=props,
+                        )
+                    for edge in self.edges:
+                        rel = edge["relation"]
+                        session.run(
+                            f"MATCH (a {{id: $src}}), (b {{id: $dst}}) "
+                            f"MERGE (a)-[r:{rel}]->(b) SET r.weight = $w, r.label = $lbl",
+                            src=edge["source"],
+                            dst=edge["target"],
+                            w=edge.get("weight", 0.5),
+                            lbl=edge.get("label", ""),
+                        )
             self.neo4j_synced = True
         except Exception:
             self.neo4j_synced = False
@@ -793,48 +930,10 @@ class StartupTaxonomyGraphEngine:
         clean = title.replace("[모집중]", "").strip()
         return clean if len(clean) <= max_len else clean[:max_len] + "..."
 
-    @staticmethod
+    @classmethod
     def render_interactive_graph_html(
-        nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]]
+        cls, nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]]
     ) -> str:
-        color_palette = {
-            "Persona": {
-                "bg": "#DC2626",
-                "border": "#7F1D1D",
-                "font": "#FFFFFF",
-                "shape": "box",
-                "col_x": -520,
-            },
-            "CoreNeed": {
-                "bg": "#F59E0B",
-                "border": "#92400E",
-                "font": "#111827",
-                "shape": "box",
-                "col_x": -190,
-            },
-            "Announcement": {
-                "bg": "#059669",
-                "border": "#064E3B",
-                "font": "#FFFFFF",
-                "shape": "box",
-                "col_x": 190,
-            },
-            "SupportCategory": {
-                "bg": "#7C3AED",
-                "border": "#4C1D95",
-                "font": "#FFFFFF",
-                "shape": "ellipse",
-                "col_x": 540,
-            },
-            "Organization": {
-                "bg": "#334155",
-                "border": "#0F172A",
-                "font": "#FFFFFF",
-                "shape": "box",
-                "col_x": 540,
-            },
-        }
-
         grouped_nodes: Dict[str, List[Dict[str, Any]]] = {
             "Persona": [],
             "CoreNeed": [],
@@ -863,7 +962,9 @@ class StartupTaxonomyGraphEngine:
 
             for idx, n in enumerate(group_list):
                 ntype = n.get("type", "Announcement")
-                style = color_palette.get(ntype, color_palette["Announcement"])
+                style = cls._NODE_COLOR_PALETTE.get(
+                    ntype, cls._NODE_COLOR_PALETTE["Announcement"]
+                )
                 props = n.get("properties", {})
                 pos_x = style["col_x"]
                 pos_y = start_y + idx * spacing_y

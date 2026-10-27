@@ -1,4 +1,4 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from crawler import KStartupOngoingCrawler
@@ -13,37 +13,58 @@ class KStartupRAGEngine:
     적용하여 정밀 근거(Evidence)를 도출하는 RAG 엔진
     """
 
-    STOPWORDS = {
-        "현재", "있는", "위한", "이상", "모집중", "공고를", "공고",
-        "추천해주세요", "지원과", "가능한", "필요합니다", "찾고", "있습니다",
-    }
+    STOPWORDS = frozenset(
+        {
+            "현재",
+            "있는",
+            "위한",
+            "이상",
+            "모집중",
+            "공고를",
+            "공고",
+            "추천해주세요",
+            "지원과",
+            "가능한",
+            "필요합니다",
+            "찾고",
+            "있습니다",
+        }
+    )
 
     def __init__(self):
         self.documents: List[Dict[str, Any]] = []
+        self._doc_titles_lower: List[str] = []
+        self._category_dist: Dict[str, int] = {}
         self.vectorizer = TfidfVectorizer(ngram_range=(1, 2))
         self.tfidf_matrix = None
         self.is_indexed = False
 
     def build_index(self, announcements: List[Dict[str, Any]]) -> int:
         self.documents = announcements
+        self._doc_titles_lower = []
+        self._category_dist = {}
+
         if not self.documents:
             self.is_indexed = False
             return 0
 
-        corpus = [
-            doc.get("_search_text")
-            or (
-                f"{doc.get('title', '')} {doc.get('category', '')} "
-                f"{doc.get('organization', '')} {doc.get('target_stage', '')} "
-                f"{doc.get('region', '')} {doc.get('summary', '')}"
-            ).lower()
-            for doc in self.documents
-        ]
+        corpus: List[str] = []
+        for doc in self.documents:
+            self._doc_titles_lower.append(doc.get("title", "").lower())
+            cat = doc.get("category", "기타")
+            self._category_dist[cat] = self._category_dist.get(cat, 0) + 1
+            corpus.append(
+                doc.get("_search_text") or KStartupOngoingCrawler.build_search_text(doc)
+            )
+
         self.tfidf_matrix = self.vectorizer.fit_transform(corpus)
         self.is_indexed = True
         return len(self.documents)
 
     def get_category_distribution(self) -> Dict[str, int]:
+        if self.is_indexed and len(self._doc_titles_lower) == len(self.documents):
+            return dict(self._category_dist)
+
         dist: Dict[str, int] = {}
         for doc in self.documents:
             cat = doc.get("category", "기타")
@@ -62,18 +83,20 @@ class KStartupRAGEngine:
             return []
 
         persona_label = StartupTaxonomyGraphEngine.map_stage_to_persona(user_stage)
-        query_vec = self.vectorizer.transform([query.lower()])
+        q_lower = query.lower()
+        query_vec = self.vectorizer.transform([q_lower])
         similarities = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
 
         query_terms = list(
             dict.fromkeys(
-                t.strip()
-                for t in query.lower().split()
-                if len(t.strip()) >= 2 and t.strip() not in self.STOPWORDS
+                t
+                for t in q_lower.split()
+                if len(t) >= 2 and t not in self.STOPWORDS
             )
         )
 
-        candidate_docs: List[Dict[str, Any]] = []
+        use_cached_titles = len(self._doc_titles_lower) == len(self.documents)
+        candidates_meta: List[Tuple[Dict[str, Any], float, float, float, Dict[str, Any], List[str]]] = []
         raw_scores_100: List[float] = []
 
         for idx, doc in enumerate(self.documents):
@@ -85,13 +108,17 @@ class KStartupRAGEngine:
             tfidf_pts = min(raw_cosine * 65.0, 25.0)
 
             # 2) 키워드 일치 점수 (제목 일치 가중치 우대, 최대 25점)
-            title_lower = doc.get("title", "").lower()
+            title_lower = (
+                self._doc_titles_lower[idx]
+                if use_cached_titles
+                else doc.get("title", "").lower()
+            )
             doc_text = doc.get("_search_text") or (
                 f"{title_lower} {doc.get('category', '')} "
                 f"{doc.get('target_stage', '')} {doc.get('region', '')} {doc.get('summary', '')}"
             ).lower()
 
-            matched_terms = []
+            matched_terms: List[str] = []
             kw_pts = 0.0
             for term in query_terms:
                 if term in title_lower:
@@ -117,8 +144,28 @@ class KStartupRAGEngine:
             else:
                 raw_100 = min(tfidf_pts + kw_pts + stage_pts + region_pts, 100.0)
 
+            candidates_meta.append(
+                (doc, round(raw_100, 2), raw_cosine, kw_pts, eval_res, matched_terms)
+            )
+            raw_scores_100.append(raw_100)
+
+        if not candidates_meta:
+            return []
+
+        # 전체 후보군에 대해 3단계 통계 스케일링(상위 3~4건 >= 0.80) 일괄 적용
+        scaled_scores = StartupTaxonomyGraphEngine.scale_scores_distribution(
+            raw_scores_100=raw_scores_100,
+            top_target_count=4,
+        )
+
+        scored_candidates = list(zip(scaled_scores, candidates_meta))
+        scored_candidates.sort(
+            key=lambda item: (item[0], item[1][1]), reverse=True
+        )
+
+        results: List[Dict[str, Any]] = []
+        for s_score, (doc, _, raw_cosine, kw_pts, eval_res, matched_terms) in scored_candidates[:top_k]:
             doc_copy = {k: v for k, v in doc.items() if k != "_search_text"}
-            doc_copy["_raw_100"] = round(raw_100, 2)
             doc_copy["evidence_detail"] = {
                 "tfidf_cosine": round(raw_cosine, 3),
                 "keyword_boost": round(kw_pts / 100.0, 3),
@@ -127,31 +174,79 @@ class KStartupRAGEngine:
                 "matched_terms": matched_terms[:8],
                 "persona_criteria_basis": eval_res["criteria_basis"],
             }
-            candidate_docs.append(doc_copy)
-            raw_scores_100.append(raw_100)
-
-        # 전체 후보군에 대해 3단계 통계 스케일링(상위 3~4건 >= 0.80) 일괄 적용
-        scaled_scores = StartupTaxonomyGraphEngine.scale_scores_distribution(
-            raw_scores_100=raw_scores_100,
-            top_target_count=4,
-        )
-
-        for doc_copy, s_score in zip(candidate_docs, scaled_scores):
             doc_copy["rag_score"] = s_score
+            results.append(doc_copy)
 
-        candidate_docs.sort(
-            key=lambda x: (x["rag_score"], x.get("_raw_100", 0.0)), reverse=True
-        )
-        for d in candidate_docs:
-            d.pop("_raw_100", None)
-
-        return candidate_docs[:top_k]
+        return results
 
 
 class MCPServerRegistry:
     """
     Model Context Protocol (MCP) 표준 도구 레지스트리 및 호출 처리기
     """
+
+    _MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
+        {
+            "name": "mcp_kstartup_crawl_ongoing",
+            "description": "K-Startup '모집중' 공고 데이터셋(mock_data.json)을 로드하고 RAG 벡터 인덱스 및 GraphDB 택사노미를 갱신합니다.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+        {
+            "name": "mcp_kstartup_rag_search",
+            "description": "인덱싱된 '모집중' 공고에서 창업자 프로필과 질의에 부합하는 공고 및 정량적 매칭 근거를 검색합니다.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "user_stage": {"type": "string"},
+                    "user_region": {"type": "string"},
+                    "category_filter": {"type": "string", "default": "전체"},
+                    "top_k": {"type": "integer", "default": 3},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "mcp_analyze_startup_eligibility",
+            "description": "3대 페르소나 적격 판단 기준에 따라 후보 공고의 지원대상·주관지역·마감일과 사용자 프로필을 교차 검증합니다.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "user_stage": {"type": "string"},
+                    "user_region": {"type": "string"},
+                    "candidates": {"type": "array", "items": {"type": "object"}},
+                },
+            },
+        },
+        {
+            "name": "mcp_kstartup_persona_graph_query",
+            "description": "GraphDB 택사노미(예비창업자 / 창업 초기 3년 내외 팀 / 그 이상 베테랑 팀)를 탐색하여 핵심 성장 과제와 연결된 맞춤 공고 서브그래프를 반환합니다.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "persona_name": {
+                        "type": "string",
+                        "enum": [
+                            "예비창업자",
+                            "창업 초기(3년 내외) 팀",
+                            "그 이상 베테랑 팀",
+                            "전체 페르소나 비교",
+                        ],
+                    },
+                    "min_score": {"type": "number", "default": 0.25},
+                },
+                "required": ["persona_name"],
+            },
+        },
+    ]
+
+    _COMMON_CHECKLIST_ITEMS: Tuple[str, str] = (
+        "지원 제외 대상 점검: 금융기관 채무불이행, 국세·지방세 체납, 중기부 동일 창업사업화 지원사업 중복 수혜 여부 사전 점검",
+        "제출서류 양식 준수: 공고 상세페이지에 첨부된 최신 PSST(Problem-Solution-Scaleup-Team) 사업계획서 양식 사용 필수",
+    )
 
     def __init__(
         self,
@@ -164,66 +259,19 @@ class MCPServerRegistry:
         self.graph_engine = graph_engine or StartupTaxonomyGraphEngine()
         self.last_crawl_status = "대기중"
 
+    def _load_and_index_all(self) -> Tuple[int, Dict[str, int], str]:
+        data, status = self.crawler.fetch_ongoing_announcements()
+        self.last_crawl_status = status
+        indexed_count = self.rag_engine.build_index(data)
+        graph_stats = self.graph_engine.build_knowledge_graph(data)
+        return indexed_count, graph_stats, status
+
     def list_tools(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "name": "mcp_kstartup_crawl_ongoing",
-                "description": "K-Startup '모집중' 공고 데이터셋(mock_data.json)을 로드하고 RAG 벡터 인덱스 및 GraphDB 택사노미를 갱신합니다.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "mcp_kstartup_rag_search",
-                "description": "인덱싱된 '모집중' 공고에서 창업자 프로필과 질의에 부합하는 공고 및 정량적 매칭 근거를 검색합니다.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "user_stage": {"type": "string"},
-                        "user_region": {"type": "string"},
-                        "category_filter": {"type": "string", "default": "전체"},
-                        "top_k": {"type": "integer", "default": 3},
-                    },
-                    "required": ["query"],
-                },
-            },
-            {
-                "name": "mcp_analyze_startup_eligibility",
-                "description": "3대 페르소나 적격 판단 기준에 따라 후보 공고의 지원대상·주관지역·마감일과 사용자 프로필을 교차 검증합니다.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "user_stage": {"type": "string"},
-                        "user_region": {"type": "string"},
-                        "candidates": {"type": "array", "items": {"type": "object"}},
-                    },
-                },
-            },
-            {
-                "name": "mcp_kstartup_persona_graph_query",
-                "description": "GraphDB 택사노미(예비창업자 / 창업 초기 3년 내외 팀 / 그 이상 베테랑 팀)를 탐색하여 핵심 성장 과제와 연결된 맞춤 공고 서브그래프를 반환합니다.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "persona_name": {
-                            "type": "string",
-                            "enum": ["예비창업자", "창업 초기(3년 내외) 팀", "그 이상 베테랑 팀", "전체 페르소나 비교"],
-                        },
-                        "min_score": {"type": "number", "default": 0.25},
-                    },
-                    "required": ["persona_name"],
-                },
-            },
-        ]
+        return list(self._MCP_TOOLS_SCHEMA)
 
     def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         if tool_name == "mcp_kstartup_crawl_ongoing":
-            data, status = self.crawler.fetch_ongoing_announcements()
-            self.last_crawl_status = status
-            indexed_count = self.rag_engine.build_index(data)
-            graph_stats = self.graph_engine.build_knowledge_graph(data)
+            indexed_count, graph_stats, status = self._load_and_index_all()
             return {
                 "protocol": "MCP/1.0",
                 "tool": tool_name,
@@ -242,10 +290,7 @@ class MCPServerRegistry:
             top_k = arguments.get("top_k", 3)
 
             if not self.rag_engine.is_indexed:
-                data, status = self.crawler.fetch_ongoing_announcements()
-                self.last_crawl_status = status
-                self.rag_engine.build_index(data)
-                self.graph_engine.build_knowledge_graph(data)
+                self._load_and_index_all()
 
             matched = self.rag_engine.retrieve(
                 query=query,
@@ -295,8 +340,7 @@ class MCPServerRegistry:
 
             checklist = [
                 f"[{persona_label} 적격 기준 대조] {persona_criteria['criteria_summary']}",
-                "지원 제외 대상 점검: 금융기관 채무불이행, 국세·지방세 체납, 중기부 동일 창업사업화 지원사업 중복 수혜 여부 사전 점검",
-                "제출서류 양식 준수: 공고 상세페이지에 첨부된 최신 PSST(Problem-Solution-Scaleup-Team) 사업계획서 양식 사용 필수",
+                *self._COMMON_CHECKLIST_ITEMS,
             ]
             return {
                 "protocol": "MCP/1.0",
