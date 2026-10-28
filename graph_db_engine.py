@@ -1,6 +1,8 @@
 import json
 import math
 import os
+import re
+from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from dotenv import load_dotenv
 
@@ -155,6 +157,56 @@ class StartupTaxonomyGraphEngine:
         "판로ㆍ해외진출",
     )
 
+    _STAGE_PHRASE_TOKENS: Tuple[str, ...] = (
+        "예비창업자",
+        "예비~도약기",
+        "전체 창업자",
+        "초기창업자",
+        "3년 이내",
+        "창업 7년 이내",
+        "7년 이내",
+        "도약기",
+        "3년 초과 ~ 7년 이내",
+        "3~7년 이내",
+        "3~7년",
+        "소상공인",
+    )
+
+    _YOUTH_LIMIT_PHRASES: Tuple[str, ...] = (
+        "만 39세 이하",
+        "만 29세 이하",
+        "청년창업사관학교",
+        "청년 예비창업자",
+        "청년 창업가",
+        "청년 기술창업자",
+    )
+
+    _SENIOR_LIMIT_PHRASES: Tuple[str, ...] = (
+        "중장년 기술창업센터",
+        "중장년",
+    )
+
+    _PRE_CAREER_KEYWORDS: Tuple[str, ...] = (
+        "창업 전",
+        "창업전",
+        "예비창업",
+        "예비",
+        "미등록",
+        "사업자 없음",
+        "설립 전",
+        "등록 전",
+    )
+
+    _CAREER_YM_DATE_RE = re.compile(
+        r"(20[0-2]\d)\s*(?:년|[.\-/])\s*(\d{1,2})\s*(?:월)?"
+    )
+    _CAREER_Y_DATE_RE = re.compile(
+        r"(20[0-2]\d)\s*년\s*(?:에\s*)?(?:창업|설립|개업|법인|등록)?"
+    )
+    _CAREER_YM_SPAN_RE = re.compile(r"(\d+)\s*년\s*(\d+)\s*개월")
+    _CAREER_Y_SPAN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*년(?:\s*차)?")
+    _CAREER_M_SPAN_RE = re.compile(r"(\d+)\s*개월")
+
     _NODE_COLOR_PALETTE: Dict[str, Dict[str, Any]] = {
         "Persona": {
             "bg": "#DC2626",
@@ -193,7 +245,6 @@ class StartupTaxonomyGraphEngine:
         },
     }
 
-    # 페르소나별 핵심과제 카테고리 집합(frozenset) 및 (원본 키워드, 소문자 키워드) 튜플 사전 연산 캐시
     _PREPARED_CORE_NEEDS: Dict[str, Tuple[Dict[str, Any], ...]] = {
         p_label: tuple(
             {
@@ -248,16 +299,92 @@ class StartupTaxonomyGraphEngine:
         }
 
     @classmethod
+    def parse_career_months(cls, career_text: str) -> Optional[int]:
+        """
+        사용자가 입력한 '정확한 업력' 문자열을 개월 수(int)로 변환합니다.
+        - 예비창업/창업 전/0년: 0 반환
+        - 기창업 연차/개월/설립연월: 개월 수(>= 1) 반환
+        - 파싱 불가 또는 미입력: None 반환
+        """
+        if not career_text:
+            return None
+        clean = career_text.strip()
+        if not clean or clean == "선택 안 함":
+            return None
+
+        if any(kw in clean for kw in cls._PRE_CAREER_KEYWORDS):
+            return 0
+
+        now = datetime.now()
+
+        # 1) YYYY년 M월 설립/창업 패턴
+        ym_date_match = cls._CAREER_YM_DATE_RE.search(clean)
+        if ym_date_match:
+            year = int(ym_date_match.group(1))
+            month = int(ym_date_match.group(2))
+            if 2000 <= year <= now.year and 1 <= month <= 12:
+                diff = (now.year - year) * 12 + (now.month - month)
+                return max(diff, 1)
+
+        # 2) N년 M개월 패턴
+        ym_span_match = cls._CAREER_YM_SPAN_RE.search(clean)
+        if ym_span_match:
+            years = int(ym_span_match.group(1))
+            months = int(ym_span_match.group(2))
+            return years * 12 + months
+
+        # 3) YYYY년 설립/창업 패턴 (연도 4자리)
+        y_date_match = cls._CAREER_Y_DATE_RE.search(clean)
+        if y_date_match:
+            year = int(y_date_match.group(1))
+            if 2000 <= year <= now.year:
+                return max((now.year - year) * 12, 1)
+
+        # 4) N년(차) 패턴
+        y_span_match = cls._CAREER_Y_SPAN_RE.search(clean)
+        if y_span_match:
+            val = float(y_span_match.group(1))
+            if val <= 0:
+                return 0
+            return max(int(round(val * 12)), 1)
+
+        # 5) M개월 패턴
+        m_span_match = cls._CAREER_M_SPAN_RE.search(clean)
+        if m_span_match:
+            months = int(m_span_match.group(1))
+            return max(months, 0)
+
+        return None
+
+    @classmethod
+    def _extract_stage_matched_tokens(cls, target_stage: str) -> List[str]:
+        tokens = [tok for tok in cls._STAGE_PHRASE_TOKENS if tok in target_stage]
+        if not tokens and target_stage:
+            tokens.append(target_stage)
+        return tokens
+
+    @classmethod
     def evaluate_stage_and_region(
-        cls, persona_label: str, user_region: str, ann: Dict[str, Any]
+        cls,
+        persona_label: str,
+        user_region: str,
+        ann: Dict[str, Any],
+        optional_profile: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
-        [공통 적격 판정 엔진]
-        페르소나별 적격 판단 기준에 따라 공고의 지원대상(target_stage) 및 지역(region) 적합도를
-        정량 점수(업력 최대 0.35, 지역 최대 0.15)와 판정 근거 문구로 일관되게 산출합니다.
+        [공통 적격 판정 및 하드 필터링 엔진]
+        페르소나별 적격 판단 기준과 선택 프로필(연령대, 사업자 형태, 정확한 업력)에 따라
+        공고의 지원대상(target_stage), 지역(region), 제목(title), 요약(summary) 적합도를 검증하고,
+        실제 판정 근거가 된 공고 내 매칭 문구(matched_eligibility_phrases / matched_disqualification_phrases)와
+        하드 필터링 적격 여부(is_eligible)를 산출합니다.
         """
         target = ann.get("target_stage", "")
         doc_region = ann.get("region", "전국")
+        title = ann.get("title", "")
+        summary = ann.get("summary", "")
+        org = ann.get("organization", "")
+        combined_text = f"{title} {summary} {org} {target}"
+
         p_meta = cls.PERSONA_TAXONOMY.get(
             persona_label, cls.PERSONA_TAXONOMY["예비창업자"]
         )
@@ -334,21 +461,296 @@ class StartupTaxonomyGraphEngine:
                 stage_verdict = "부적합 가능성 높음 (예비 또는 업력 3년 이내 전용 공고로 3년 초과 베테랑 팀 기준 불일치)"
 
         # 지역 판정 (최대 0.15)
+        matched_non_metro = [k for k in cls._NON_METRO_REGIONS if k in doc_region]
         if not user_region or user_region == "전국 무관":
             region_score = 0.12
             region_verdict = f"적합 (공고 지역: {doc_region})"
+            region_matched_phrase = f"지역: '{doc_region}' (전국 무관 조건)"
         elif user_region in doc_region:
             region_score = 0.15
             region_verdict = f"적합 (사용자 지역 '{user_region}'과 공고 지역 '{doc_region}' 일치)"
+            region_matched_phrase = f"지역일치: '{user_region}' (공고문 '{doc_region}')"
         elif "전국" in doc_region:
             region_score = 0.12
             region_verdict = f"적합 (전국 단위 모집 공고: {doc_region})"
-        elif "비수도권" in user_region and any(k in doc_region for k in cls._NON_METRO_REGIONS):
+            region_matched_phrase = f"전국모집: '전국' (공고문 '{doc_region}')"
+        elif "비수도권" in user_region and matched_non_metro:
             region_score = 0.14
             region_verdict = f"적합 (비수도권/로컬 우대 및 지역 부합: {doc_region})"
+            region_matched_phrase = f"비수도권부합: '{matched_non_metro[0]}' (공고문 '{doc_region}')"
         else:
             region_score = 0.03
             region_verdict = f"주의 (공고 주관/제한 지역 '{doc_region}' 소재지 요건 또는 협약 내 이전 조건 확인 필요)"
+            region_matched_phrase = f"제한지역: '{doc_region}'"
+
+        matched_eligibility_phrases: List[str] = []
+        disqualification_reasons: List[str] = []
+        matched_disqualification_phrases: List[str] = []
+
+        stage_tokens = cls._extract_stage_matched_tokens(target)
+        stage_token_str = ", ".join(f"'{t}'" for t in stage_tokens) if stage_tokens else f"'{target}'"
+
+        # 1) 업력 하드 필터링 판정 (0.0점 부적격 및 0.04~0.10점 조건부 주의 모두 배제)
+        if stage_score > 0.10:
+            for tok in stage_tokens:
+                matched_eligibility_phrases.append(f"지원대상 문구: '{tok}'")
+        else:
+            disqualification_reasons.append(
+                f"[업력/대상 결격] {stage_verdict} (감지된 공고 지원대상 문구: {stage_token_str})"
+            )
+            matched_disqualification_phrases.append(f"지원대상: '{target}'")
+
+        # 2) 지역 하드 필터링 판정 (0.03점 이하 지역 불일치 배제)
+        if region_score > 0.03:
+            matched_eligibility_phrases.append(region_matched_phrase)
+        else:
+            disqualification_reasons.append(
+                f"[지역 요건 결격] 사용자 지역('{user_region}')과 공고 제한 지역('{doc_region}') 불일치 (감지 문구: '{doc_region}')"
+            )
+            matched_disqualification_phrases.append(region_matched_phrase)
+
+        # 3) 선택 프로필(대표자 연령대, 사업자 형태, 정확한 업력) 정밀 검증 및 하드 필터링
+        opt_verdict_parts: List[str] = []
+        if optional_profile:
+            age_group = (optional_profile.get("age_group") or "선택 안 함").strip()
+            business_type = (optional_profile.get("business_type") or "선택 안 함").strip()
+            exact_career = (optional_profile.get("exact_career") or "").strip()
+
+            # (3-1) 대표자 연령대 검증
+            if age_group and age_group != "선택 안 함":
+                youth_hits = [p for p in cls._YOUTH_LIMIT_PHRASES if p in combined_text]
+                senior_hits = [p for p in cls._SENIOR_LIMIT_PHRASES if p in combined_text]
+
+                if age_group == "만 40세 이상":
+                    if youth_hits:
+                        hit_str = ", ".join(f"'{h}'" for h in youth_hits)
+                        disqualification_reasons.append(
+                            f"[대표자 연령 결격] 선택 연령대('{age_group}')이나 공고에 청년 연령 제한 문구({hit_str})가 존재함"
+                        )
+                        for h in youth_hits:
+                            matched_disqualification_phrases.append(f"연령제한 문구: '{h}'")
+                        opt_verdict_parts.append(f"연령 결격(청년 전용 {hit_str} 감지)")
+                    elif senior_hits:
+                        for h in senior_hits:
+                            matched_eligibility_phrases.append(f"연령특화 문구: '{h}'")
+                        opt_verdict_parts.append(
+                            f"연령 적합('{age_group}' — '{senior_hits[0]}' 특화 부합)"
+                        )
+                    else:
+                        matched_eligibility_phrases.append("연령요건: '연령 제한 없음'")
+                        opt_verdict_parts.append(f"연령 적합('{age_group}' — 연령 제한 없음)")
+
+                elif age_group == "만 39세 이하 (청년)":
+                    if senior_hits:
+                        hit_str = ", ".join(f"'{h}'" for h in senior_hits)
+                        disqualification_reasons.append(
+                            f"[대표자 연령 결격] 선택 연령대('{age_group}')이나 공고에 중장년 특화 제한 문구({hit_str})가 존재함"
+                        )
+                        for h in senior_hits:
+                            matched_disqualification_phrases.append(f"연령제한 문구: '{h}'")
+                        opt_verdict_parts.append(f"연령 결격(중장년 전용 {hit_str} 감지)")
+                    elif youth_hits:
+                        for h in youth_hits:
+                            matched_eligibility_phrases.append(f"청년특화 문구: '{h}'")
+                        if "만 29세 이하" in youth_hits:
+                            opt_verdict_parts.append(
+                                "연령 조건부 적합(청년 특화 '만 29세 이하' 문구 매칭 — 만 29세 이하 여부 세부 확인)"
+                            )
+                        else:
+                            opt_verdict_parts.append(
+                                f"연령 핵심 부합('{age_group}' — '{youth_hits[0]}' 문구 매칭)"
+                            )
+                    else:
+                        matched_eligibility_phrases.append("연령요건: '연령 제한 없음'")
+                        opt_verdict_parts.append(f"연령 적합('{age_group}' — 연령 제한 없음)")
+
+            # (3-2) 사업자 형태 검증
+            if business_type and business_type != "선택 안 함":
+                is_pre_only_ann = (
+                    target == "예비창업자"
+                    or (
+                        "예비" in target
+                        and "초기" not in target
+                        and "3년" not in target
+                        and "도약" not in target
+                        and "7년" not in target
+                        and "소상공인" not in target
+                    )
+                )
+                allows_pre_ann = ("예비" in target) or ("전체" in target)
+
+                if business_type == "미등록 (예비창업)":
+                    if not allows_pre_ann:
+                        disqualification_reasons.append(
+                            f"[사업자 형태 결격] 선택 사업자 형태('{business_type}')이나 공고는 기창업 사업자('{target}') 전용임"
+                        )
+                        matched_disqualification_phrases.append(
+                            f"사업자요건 문구: '{target}' (기창업 전용)"
+                        )
+                        opt_verdict_parts.append(
+                            f"사업자형태 결격(기창업 '{target}' 전용)"
+                        )
+                    else:
+                        matched_eligibility_phrases.append(
+                            f"사업자형태 문구: '{target}' (미등록 예비창업 지원 가능)"
+                        )
+                        opt_verdict_parts.append(
+                            f"사업자형태 적합('{business_type}' — '{target}' 매칭)"
+                        )
+
+                elif business_type in ("개인사업자", "법인사업자"):
+                    if is_pre_only_ann:
+                        disqualification_reasons.append(
+                            f"[사업자 형태 결격] 선택 사업자 형태('{business_type}')이나 공고는 사업자 미등록 '{target}' 전용임"
+                        )
+                        matched_disqualification_phrases.append(
+                            f"사업자요건 문구: '{target}' (미등록 전용)"
+                        )
+                        opt_verdict_parts.append(
+                            f"사업자형태 결격(미등록 '{target}' 전용)"
+                        )
+                    elif business_type == "개인사업자" and "연구소기업" in combined_text:
+                        disqualification_reasons.append(
+                            "[사업자 형태 결격] 선택 사업자 형태('개인사업자')이나 공고는 법인 형태인 '출연연 연구소기업' 전용임"
+                        )
+                        matched_disqualification_phrases.append(
+                            "사업자요건 문구: '출연연 연구소기업'"
+                        )
+                        opt_verdict_parts.append(
+                            "사업자형태 결격(법인 '출연연 연구소기업' 전용)"
+                        )
+                    else:
+                        matched_eligibility_phrases.append(
+                            f"사업자형태 문구: '{target}' ({business_type} 지원 가능)"
+                        )
+                        opt_verdict_parts.append(
+                            f"사업자형태 적합('{business_type}' — '{target}' 매칭)"
+                        )
+
+            # (3-3) 정확한 업력 검증
+            if exact_career:
+                career_months = cls.parse_career_months(exact_career)
+                if career_months is not None:
+                    is_pre_only_ann = (
+                        target == "예비창업자"
+                        or (
+                            "예비" in target
+                            and "초기" not in target
+                            and "3년" not in target
+                            and "도약" not in target
+                            and "7년" not in target
+                            and "소상공인" not in target
+                        )
+                    )
+                    allows_pre_ann = ("예비" in target) or ("전체" in target)
+                    is_doyak_only_ann = (
+                        ("3~7년" in target or "3년 초과" in target or "도약" in target)
+                        and "초기" not in target
+                        and "3년 이내" not in target
+                        and "예비~도약" not in target
+                    )
+                    is_early_or_pre_only_ann = (
+                        ("예비" in target or "3년 이내" in target)
+                        and "도약" not in target
+                        and "3~7년" not in target
+                        and "7년 이내" not in target
+                        and "전체" not in target
+                    )
+
+                    if career_months == 0:
+                        if not allows_pre_ann:
+                            disqualification_reasons.append(
+                                f"[세부 업력 결격] 입력 업력('{exact_career}' → 창업 전)이나 공고는 기창업('{target}') 전용임"
+                            )
+                            matched_disqualification_phrases.append(
+                                f"업력제한 문구: '{target}'"
+                            )
+                            opt_verdict_parts.append(
+                                f"세부업력 결격('{exact_career}' vs '{target}')"
+                            )
+                        else:
+                            matched_eligibility_phrases.append(
+                                f"세부업력 매칭: '{exact_career}(창업 전)' ↔ '{target}'"
+                            )
+                            opt_verdict_parts.append(
+                                f"세부업력 적합('{exact_career}' — '{target}' 부합)"
+                            )
+
+                    elif 1 <= career_months <= 36:
+                        if is_pre_only_ann:
+                            disqualification_reasons.append(
+                                f"[세부 업력 결격] 입력 업력('{exact_career}' → {career_months}개월)이나 공고는 미등록 '{target}' 전용임"
+                            )
+                            matched_disqualification_phrases.append(
+                                f"업력제한 문구: '{target}' (미등록 전용)"
+                            )
+                            opt_verdict_parts.append(
+                                f"세부업력 결격('{exact_career}' vs 미등록 '{target}')"
+                            )
+                        elif is_doyak_only_ann:
+                            disqualification_reasons.append(
+                                f"[세부 업력 결격] 입력 업력('{exact_career}' → {career_months}개월, 3년 이하)이 도약기 전용 공고 요건('{target}', 3년 초과)에 미달함"
+                            )
+                            matched_disqualification_phrases.append(
+                                f"업력제한 문구: '{target}' (3년 초과)"
+                            )
+                            opt_verdict_parts.append(
+                                f"세부업력 결격('{exact_career}' — 도약기 3년 초과 미달)"
+                            )
+                        else:
+                            matched_eligibility_phrases.append(
+                                f"세부업력 매칭: '{exact_career}({career_months}개월, 3년 이내)' ↔ '{target}'"
+                            )
+                            opt_verdict_parts.append(
+                                f"세부업력 적합('{exact_career}'[{career_months}개월] — 3년 이내 요건 충족)"
+                            )
+
+                    elif 36 < career_months <= 84:
+                        if is_early_or_pre_only_ann:
+                            disqualification_reasons.append(
+                                f"[세부 업력 결격] 입력 업력('{exact_career}' → {career_months}개월, 3년 초과)이 공고의 업력 상한('{target}', 3년 이내)을 초과함"
+                            )
+                            matched_disqualification_phrases.append(
+                                f"업력제한 문구: '{target}' (3년 이내 상한)"
+                            )
+                            opt_verdict_parts.append(
+                                f"세부업력 결격('{exact_career}' — 3년 이내 상한 초과)"
+                            )
+                        else:
+                            matched_eligibility_phrases.append(
+                                f"세부업력 매칭: '{exact_career}({career_months}개월, 3~7년 이내)' ↔ '{target}'"
+                            )
+                            opt_verdict_parts.append(
+                                f"세부업력 적합('{exact_career}'[{career_months}개월] — 도약기/7년 이내 요건 충족)"
+                            )
+
+                    else:  # career_months > 84 (7년 초과)
+                        if any(k in target for k in ("예비", "3년 이내", "7년 이내", "3~7년")):
+                            disqualification_reasons.append(
+                                f"[세부 업력 결격] 입력 업력('{exact_career}' → {career_months}개월, 7년 초과)이 공고의 업력 상한('{target}', 7년 이내)을 초과함"
+                            )
+                            matched_disqualification_phrases.append(
+                                f"업력제한 문구: '{target}' (7년 이내 상한)"
+                            )
+                            opt_verdict_parts.append(
+                                f"세부업력 결격('{exact_career}' — 7년 이내 상한 초과)"
+                            )
+                        else:
+                            matched_eligibility_phrases.append(
+                                f"세부업력 매칭: '{exact_career}({career_months}개월)' ↔ '{target}'"
+                            )
+                            opt_verdict_parts.append(f"세부업력 적합('{exact_career}')")
+
+        optional_profile_verdict = (
+            " / ".join(opt_verdict_parts)
+            if opt_verdict_parts
+            else "선택 프로필 미입력 (기본 페르소나·지역 기준 적용)"
+        )
+        is_eligible = (
+            (stage_score > 0.10)
+            and (region_score > 0.03)
+            and (len(disqualification_reasons) == 0)
+        )
 
         return {
             "stage_score": stage_score,
@@ -357,6 +759,11 @@ class StartupTaxonomyGraphEngine:
             "region_score": region_score,
             "region_verdict": region_verdict,
             "criteria_basis": criteria_summary,
+            "optional_profile_verdict": optional_profile_verdict,
+            "is_eligible": is_eligible,
+            "matched_eligibility_phrases": matched_eligibility_phrases,
+            "disqualification_reasons": disqualification_reasons,
+            "matched_disqualification_phrases": matched_disqualification_phrases,
         }
 
     @staticmethod
@@ -414,7 +821,6 @@ class StartupTaxonomyGraphEngine:
         winsorized = []
         for v in step_up_vals:
             if v > high_fence:
-                # 이상치의 폭주는 95% 억제하되 미세한 순위 차이는 보존
                 winsorized.append(high_fence + (v - high_fence) * 0.05)
             elif v < low_fence:
                 winsorized.append(low_fence - (low_fence - v) * 0.05)
@@ -431,7 +837,6 @@ class StartupTaxonomyGraphEngine:
         sorted_z_asc = sorted(z_scores)
         z_med = cls._percentile(sorted_z_asc, 0.50)
 
-        # 상위 top_target_count(기본 4개, 즉 3~4개)가 >= 0.80에 안착하도록 경계 Z값 산출
         if n_valid > top_target_count:
             z_top_border = sorted_z_asc[n_valid - top_target_count]
             z_next = sorted_z_asc[n_valid - top_target_count - 1]
@@ -442,12 +847,10 @@ class StartupTaxonomyGraphEngine:
         else:
             z_cut = sorted_z_asc[-1] + 0.20
 
-        # 로지스틱 곡선(0.20 ~ 0.94)에서 0.80에 도달하는 로짓(Log-odds) 값:
-        # (0.80 - 0.20) / (0.94 - 0.20) = 0.60 / 0.74 = 0.8108 -> ln(0.8108 / 0.1892) = 1.4553
         u_target_080 = 1.46
         upper_span = max(z_cut - z_med, 0.25)
         alpha_upper = u_target_080 / upper_span
-        alpha_lower = 1.15  # 하위권 완만한 감쇠로 극단적 저득점(<0.30) 비율 최소화
+        alpha_lower = 1.15
 
         result = [0.0] * total_len
         for idx_in_valid, orig_idx in enumerate(valid_indices):
@@ -459,7 +862,7 @@ class StartupTaxonomyGraphEngine:
 
             u_clamped = min(max(u, -4.0), 4.0)
             logistic_val = 1.0 / (1.0 + math.exp(-u_clamped))
-            final_val = 0.20 + logistic_val * 0.74  # 범위: 0.20 ~ 0.94
+            final_val = 0.20 + logistic_val * 0.74
             result[orig_idx] = round(final_val, 2)
 
         return result
@@ -598,7 +1001,7 @@ class StartupTaxonomyGraphEngine:
                 }
             )
 
-        # [방식 1 적용] 페르소나별 독립 스케일링 (페르소나당 상위 3~4개만 >= 0.80 배정)
+        # 페르소나별 독립 스케일링 (하드 필터링 적격 공고 대상, 페르소나당 상위 3~4개만 >= 0.80 배정)
         for p_name, p_data in self.PERSONA_TAXONOMY.items():
             raw_assoc_list: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
             raw_scores_100: List[float] = []
@@ -632,6 +1035,9 @@ class StartupTaxonomyGraphEngine:
                             "stage_fit": assoc_info["stage_fit"],
                             "stage_verdict": assoc_info["stage_verdict"],
                             "criteria_basis": assoc_info["criteria_basis"],
+                            "matched_eligibility_phrases": assoc_info.get(
+                                "matched_eligibility_phrases", []
+                            ),
                             "reason": assoc_info["reason"],
                         }
                     )
@@ -649,7 +1055,7 @@ class StartupTaxonomyGraphEngine:
     ) -> Dict[str, Any]:
         """
         100점 만점 정밀 원점수(raw_score_100) 산출:
-        - 업력 적격 점수 (최대 35점)
+        - 업력 적격 점수 (최대 35점) — 업력 부적격(0.0) 및 조건부 주의(<=0.10)는 하드 필터링(0점 처리)
         - 주력 핵심과제 분야 및 제목/요약 키워드 정합성 (최대 55점)
         - 부가 핵심과제 복합 시너지 및 전국/특화 가산점 (최대 10점)
         """
@@ -657,7 +1063,8 @@ class StartupTaxonomyGraphEngine:
         eval_res = self.evaluate_stage_and_region(p_label, "전국 무관", ann)
         stage_score_100 = eval_res["stage_score"] * 100.0  # 최대 35.0점
 
-        if stage_score_100 <= 5.0:
+        # 엄격한 하드 필터링 기준: 업력 부적격(0.0점) 또는 조건부 주의(<=10.0점)는 제외
+        if not eval_res["is_eligible"] or stage_score_100 <= 10.0:
             return {
                 "raw_score_100": 0.0,
                 "best_need_id": None,
@@ -666,6 +1073,7 @@ class StartupTaxonomyGraphEngine:
                 "stage_fit": eval_res["stage_fit"],
                 "stage_verdict": eval_res["stage_verdict"],
                 "criteria_basis": eval_res["criteria_basis"],
+                "matched_eligibility_phrases": [],
                 "reason": eval_res["stage_verdict"],
             }
 
@@ -749,6 +1157,7 @@ class StartupTaxonomyGraphEngine:
             "stage_fit": eval_res["stage_fit"],
             "stage_verdict": eval_res["stage_verdict"],
             "criteria_basis": eval_res["criteria_basis"],
+            "matched_eligibility_phrases": eval_res["matched_eligibility_phrases"],
             "reason": reason,
         }
 
@@ -758,6 +1167,8 @@ class StartupTaxonomyGraphEngine:
         selected_need_name: str = "전체",
         min_score: float = 0.25,
         include_org_nodes: bool = True,
+        include_need_nodes: bool = True,
+        include_cat_nodes: bool = True,
     ) -> Dict[str, Any]:
         target_personas = (
             list(self.PERSONA_TAXONOMY.keys())
@@ -802,14 +1213,17 @@ class StartupTaxonomyGraphEngine:
         )
 
         allowed_need_ids = set()
+        need_to_persona_id: Dict[str, str] = {}
         for edge in has_need_edges:
             if edge["source"] in persona_ids:
                 need_node = self.nodes.get(edge["target"], {})
                 if selected_need_name != "전체" and need_node.get("label") != selected_need_name:
                     continue
                 allowed_need_ids.add(edge["target"])
-                active_node_ids.add(edge["target"])
-                vis_edges.append(edge)
+                need_to_persona_id[edge["target"]] = edge["source"]
+                if include_need_nodes:
+                    active_node_ids.add(edge["target"])
+                    vis_edges.append(edge)
 
         matched_ann_ids = set()
         ann_max_score: Dict[str, float] = {}
@@ -819,7 +1233,20 @@ class StartupTaxonomyGraphEngine:
                 ann_id = edge["target"]
                 matched_ann_ids.add(ann_id)
                 active_node_ids.add(ann_id)
-                vis_edges.append(edge)
+
+                if include_need_nodes:
+                    vis_edges.append(edge)
+                else:
+                    # '핵심 성장 과제' 노드를 숨긴 경우에도 선택된 페르소나와 적격 공고 간 직접 연결 유지
+                    parent_p_id = need_to_persona_id.get(edge["source"])
+                    if not parent_p_id:
+                        p_label = edge.get("persona", "")
+                        parent_p_id = self.PERSONA_TAXONOMY.get(p_label, {}).get("id")
+                    if parent_p_id:
+                        direct_edge = dict(edge)
+                        direct_edge["source"] = parent_p_id
+                        direct_edge["label"] = f"연관도 {edge['weight']:.2f}"
+                        vis_edges.append(direct_edge)
 
                 if edge["weight"] > ann_max_score.get(ann_id, 0.0):
                     ann_max_score[ann_id] = edge["weight"]
@@ -837,6 +1264,9 @@ class StartupTaxonomyGraphEngine:
                         "stage_fit": edge.get("stage_fit", ""),
                         "stage_verdict": edge.get("stage_verdict", ""),
                         "criteria_basis": edge.get("criteria_basis", ""),
+                        "matched_eligibility_phrases": edge.get(
+                            "matched_eligibility_phrases", []
+                        ),
                         "d_day": ann_props.get("d_day", ""),
                         "deadline": ann_props.get("deadline", ""),
                         "association_score": edge["weight"],
@@ -846,16 +1276,18 @@ class StartupTaxonomyGraphEngine:
                     }
                 )
 
-        active_cat_ids = set()
-        for edge in belongs_to_edges:
-            if edge["source"] in matched_ann_ids:
-                active_cat_ids.add(edge["target"])
-                active_node_ids.add(edge["target"])
-                vis_edges.append(edge)
+        if include_cat_nodes:
+            active_cat_ids = set()
+            for edge in belongs_to_edges:
+                if edge["source"] in matched_ann_ids:
+                    active_cat_ids.add(edge["target"])
+                    active_node_ids.add(edge["target"])
+                    vis_edges.append(edge)
 
-        for edge in mapped_to_cat_edges:
-            if edge["source"] in allowed_need_ids and edge["target"] in active_cat_ids:
-                vis_edges.append(edge)
+            if include_need_nodes:
+                for edge in mapped_to_cat_edges:
+                    if edge["source"] in allowed_need_ids and edge["target"] in active_cat_ids:
+                        vis_edges.append(edge)
 
         if include_org_nodes:
             for edge in hosted_by_edges:

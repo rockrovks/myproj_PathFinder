@@ -84,8 +84,10 @@ _UX_ENHANCEMENT_JS = """
                     }, true);
                 });
 
-                const domainInputs = parentDoc.querySelectorAll('input[aria-label="창업 아이템 / 기술 분야"]');
-                domainInputs.forEach(inp => {
+                const syncInputs = parentDoc.querySelectorAll(
+                    'input[aria-label="창업 아이템 / 기술 분야"], input[aria-label="정확한 업력"]'
+                );
+                syncInputs.forEach(inp => {
                     if (inp.dataset.uxSyncBound === "true") return;
                     inp.dataset.uxSyncBound = "true";
 
@@ -327,8 +329,8 @@ with tab_crawler:
         search_mode = st.selectbox(
             "검색 모드",
             options=[
-                "제목 검색 (정규식)",
-                "제목+내용 (규칙+LLM 연관)",
+                "제목",
+                "제목 + 내용",
             ],
             index=0,
         )
@@ -371,7 +373,7 @@ with tab_crawler:
 
         # 3) 키워드 검색 모드별 분기
         expanded_info = None
-        is_hybrid_mode = "제목+내용" in search_mode
+        is_hybrid_mode = search_mode == "제목 + 내용"
 
         if keyword_filter and keyword_filter.strip():
             kw_str = keyword_filter.strip()
@@ -387,7 +389,7 @@ with tab_crawler:
                     )
                 filtered_df = filtered_df[mask]
             else:
-                # 제목+내용 (규칙 엔진 + LLM 하이브리드 연관 확장 검색 모드)
+                # 제목 + 내용 (규칙 엔진 + LLM 하이브리드 연관 확장 검색 모드)
                 base_records = filtered_df.drop(
                     columns=["_deadline_date", "pbanc_sn_num", "d_day_num"],
                     errors="ignore",
@@ -523,6 +525,27 @@ with tab_agent:
                 ["전체", "사업화", "기술개발(R&D)", "시설ㆍ공간ㆍ보육", "멘토링ㆍ컨설팅ㆍ교육", "판로ㆍ해외진출"],
             )
 
+        st.caption("선택사항입니다. 입력하시면 더 높은 성능으로 추천합니다.")
+        opt_col1, opt_col2, opt_col3 = st.columns(3)
+        with opt_col1:
+            u_age_group = st.selectbox(
+                "대표자 연령대",
+                ["선택 안 함", "만 39세 이하 (청년)", "만 40세 이상"],
+                index=0,
+            )
+        with opt_col2:
+            u_business_type = st.selectbox(
+                "사업자 형태",
+                ["선택 안 함", "미등록 (예비창업)", "개인사업자", "법인사업자"],
+                index=0,
+            )
+        with opt_col3:
+            u_exact_career = st.text_input(
+                "정확한 업력",
+                value="",
+                placeholder="예: 창업 전, 1년 6개월, 2024년 5월 설립",
+            )
+
         u_query = st.text_area(
             "상세 조건 및 고민 내용",
             value="현재 사업자등록 전인 예비창업자입니다. 시제품(MVP) 개발을 위한 사업화 자금 5천만원 이상 지원과 입주 가능한 보육공간이 있는 모집중 공고를 추천해주세요.",
@@ -541,6 +564,9 @@ with tab_agent:
             "domain": u_domain,
             "region": u_region,
             "category": u_category,
+            "age_group": u_age_group,
+            "business_type": u_business_type,
+            "exact_career": u_exact_career,
         }
 
         with st.spinner("프로필 및 모집 공고를 분석하고 있습니다..."):
@@ -614,9 +640,13 @@ with tab_agent:
                                 text=f"RAG 매칭 점수: {doc['rag_score']} | Graph 연관도: {doc.get('graph_score', 0.0)}",
                             )
                             st.caption(f"GraphDB 연결 과제: {doc.get('graph_core_need', '-')}")
-                            ev_terms = doc.get("evidence_detail", {}).get("matched_terms", [])
+                            ev_detail = doc.get("evidence_detail", {})
+                            ev_terms = ev_detail.get("matched_terms", [])
                             if ev_terms:
                                 st.caption(f"일치 키워드: {', '.join(ev_terms)}")
+                            elig_phrases = ev_detail.get("matched_eligibility_phrases", [])
+                            if elig_phrases:
+                                st.caption(f"적격 근거 문구: {', '.join(elig_phrases)}")
                             st.write(doc["summary"])
                             st.link_button(
                                 "공고 원문 보기",
@@ -649,7 +679,7 @@ with tab_graph:
         "창업 생애주기별 3대 페르소나(예비창업자 / 창업 초기 3년 내외 팀 / 그 이상 베테랑 팀)의 핵심 성장 과제와 K-Startup 모집중 공고 간의 다중 홉(Multi-Hop) 연관도를 고정형 고대비 그래프로 형상화합니다."
     )
 
-    g_col1, g_col2, g_col3, g_col4 = st.columns([1.6, 2.0, 1.2, 1.0])
+    g_col1, g_col2, g_col3 = st.columns([1.6, 2.0, 1.4])
 
     with g_col1:
         selected_persona = st.selectbox(
@@ -683,8 +713,13 @@ with tab_graph:
             step=0.05,
         )
 
-    with g_col4:
-        show_org_nodes = st.checkbox("주관기관 노드 표시", value=True)
+    chk_col1, chk_col2, chk_col3 = st.columns(3)
+    with chk_col1:
+        show_need_nodes = st.checkbox("핵심 성장 과제 표시", value=True)
+    with chk_col2:
+        show_cat_nodes = st.checkbox("지원분야 표시", value=True)
+    with chk_col3:
+        show_org_nodes = st.checkbox("주관기관 표시", value=True)
 
     if selected_persona in StartupTaxonomyGraphEngine.PERSONA_TAXONOMY:
         p_meta = StartupTaxonomyGraphEngine.PERSONA_TAXONOMY[selected_persona]
@@ -697,6 +732,8 @@ with tab_graph:
         selected_persona,
         selected_need,
         min_assoc_score,
+        show_need_nodes,
+        show_cat_nodes,
         show_org_nodes,
         len(st.session_state.graph_engine.edges),
     )
@@ -712,6 +749,8 @@ with tab_graph:
             persona_name=selected_persona,
             selected_need_name=selected_need,
             min_score=min_assoc_score,
+            include_need_nodes=show_need_nodes,
+            include_cat_nodes=show_cat_nodes,
             include_org_nodes=show_org_nodes,
         )
         graph_html = StartupTaxonomyGraphEngine.render_interactive_graph_html(

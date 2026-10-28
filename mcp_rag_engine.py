@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from crawler import KStartupOngoingCrawler
@@ -7,10 +7,11 @@ from graph_db_engine import StartupTaxonomyGraphEngine
 
 class KStartupRAGEngine:
     """
-    모집중 공고를 인덱싱하고, 100점 만점 다중 지표(벡터 유사도 25점 + 키워드 25점 +
-    페르소나 업력 적격성 35점 + 지역 적격성 15점)를 산출한 뒤,
-    3단계 통계 스케일링(20점 단위 지수 도약 -> IQR 이상치 보정 -> Z-Score 로지스틱 변환)을
-    적용하여 정밀 근거(Evidence)를 도출하는 RAG 엔진
+    모집중 공고를 인덱싱하고, 엄격한 하드 필터링(업력 부적격·조건부 주의, 지역 불일치,
+    선택 프로필 결격 공고 완전 배제)을 수행한 뒤,
+    적격 후보군에 대해 100점 만점 다중 지표(벡터 유사도 25점 + 키워드 25점 +
+    페르소나 업력 적격성 35점 + 지역 적격성 15점) 및 3단계 통계 스케일링을
+    적용하여 정밀 근거(Evidence)와 배제 사유 메타데이터를 분리 도출하는 RAG 엔진
     """
 
     STOPWORDS = frozenset(
@@ -35,6 +36,7 @@ class KStartupRAGEngine:
         self.documents: List[Dict[str, Any]] = []
         self._doc_titles_lower: List[str] = []
         self._category_dist: Dict[str, int] = {}
+        self.last_excluded_announcements: List[Dict[str, Any]] = []
         self.vectorizer = TfidfVectorizer(ngram_range=(1, 2))
         self.tfidf_matrix = None
         self.is_indexed = False
@@ -43,6 +45,7 @@ class KStartupRAGEngine:
         self.documents = announcements
         self._doc_titles_lower = []
         self._category_dist = {}
+        self.last_excluded_announcements = []
 
         if not self.documents:
             self.is_indexed = False
@@ -78,7 +81,9 @@ class KStartupRAGEngine:
         user_region: str = "",
         category_filter: str = "전체",
         top_k: int = 3,
+        optional_profile: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
+        self.last_excluded_announcements = []
         if not self.is_indexed or not self.documents:
             return []
 
@@ -96,18 +101,51 @@ class KStartupRAGEngine:
         )
 
         use_cached_titles = len(self._doc_titles_lower) == len(self.documents)
-        candidates_meta: List[Tuple[Dict[str, Any], float, float, float, Dict[str, Any], List[str]]] = []
+        candidates_meta: List[
+            Tuple[Dict[str, Any], float, float, float, Dict[str, Any], List[str]]
+        ] = []
         raw_scores_100: List[float] = []
 
         for idx, doc in enumerate(self.documents):
             if category_filter != "전체" and category_filter not in doc.get("category", ""):
                 continue
 
-            # 1) TF-IDF 코사인 유사도 점수 (최대 25점)
+            # 1) 페르소나 적격 기준 + 지역 + 선택 프로필(연령대, 사업자 형태, 정확한 업력) 교차 검증 및 하드 필터링
+            eval_res = StartupTaxonomyGraphEngine.evaluate_stage_and_region(
+                persona_label=persona_label,
+                user_region=user_region,
+                ann=doc,
+                optional_profile=optional_profile,
+            )
+
+            # 엄격한 하드 필터링(안 B): 업력 부적격/조건부 주의, 지역 불일치, 선택 프로필 결격 공고는 완전 배제
+            if not eval_res["is_eligible"]:
+                self.last_excluded_announcements.append(
+                    {
+                        "pbanc_sn": doc.get("pbanc_sn", ""),
+                        "title": doc.get("title", ""),
+                        "category": doc.get("category", ""),
+                        "organization": doc.get("organization", ""),
+                        "target_stage": doc.get("target_stage", ""),
+                        "region": doc.get("region", ""),
+                        "d_day": doc.get("d_day", ""),
+                        "deadline": doc.get("deadline", ""),
+                        "stage_verdict": eval_res["stage_verdict"],
+                        "region_verdict": eval_res["region_verdict"],
+                        "optional_profile_verdict": eval_res["optional_profile_verdict"],
+                        "disqualification_reasons": eval_res["disqualification_reasons"],
+                        "matched_disqualification_phrases": eval_res[
+                            "matched_disqualification_phrases"
+                        ],
+                    }
+                )
+                continue
+
+            # 2) TF-IDF 코사인 유사도 점수 (최대 25점)
             raw_cosine = float(similarities[idx])
             tfidf_pts = min(raw_cosine * 65.0, 25.0)
 
-            # 2) 키워드 일치 점수 (제목 일치 가중치 우대, 최대 25점)
+            # 3) 키워드 일치 점수 (제목 일치 가중치 우대, 최대 25점)
             title_lower = (
                 self._doc_titles_lower[idx]
                 if use_cached_titles
@@ -129,20 +167,10 @@ class KStartupRAGEngine:
                     kw_pts += 4.0
             kw_pts = min(kw_pts, 25.0)
 
-            # 3) 페르소나 적격 기준 기반 업력(최대 35점) 및 지역(최대 15점) 점수
-            eval_res = StartupTaxonomyGraphEngine.evaluate_stage_and_region(
-                persona_label=persona_label,
-                user_region=user_region,
-                ann=doc,
-            )
+            # 4) 적격 공고 업력(최대 35점) 및 지역(최대 15점) 점수 합산
             stage_pts = eval_res["stage_score"] * 100.0
             region_pts = eval_res["region_score"] * 100.0
-
-            # 업력 부적격(0점) 공고는 고득점 후보에서 배제되도록 페널티 부여
-            if stage_pts <= 5.0:
-                raw_100 = max((tfidf_pts + kw_pts) * 0.35, 13.0)
-            else:
-                raw_100 = min(tfidf_pts + kw_pts + stage_pts + region_pts, 100.0)
+            raw_100 = min(tfidf_pts + kw_pts + stage_pts + region_pts, 100.0)
 
             candidates_meta.append(
                 (doc, round(raw_100, 2), raw_cosine, kw_pts, eval_res, matched_terms)
@@ -152,7 +180,7 @@ class KStartupRAGEngine:
         if not candidates_meta:
             return []
 
-        # 전체 후보군에 대해 3단계 통계 스케일링(상위 3~4건 >= 0.80) 일괄 적용
+        # 하드 필터링을 통과한 적격 후보군에 대해 3단계 통계 스케일링(상위 3~4건 >= 0.80) 일괄 적용
         scaled_scores = StartupTaxonomyGraphEngine.scale_scores_distribution(
             raw_scores_100=raw_scores_100,
             top_target_count=4,
@@ -173,6 +201,10 @@ class KStartupRAGEngine:
                 "region_bonus": round(eval_res["region_score"], 3),
                 "matched_terms": matched_terms[:8],
                 "persona_criteria_basis": eval_res["criteria_basis"],
+                "stage_verdict": eval_res["stage_verdict"],
+                "region_verdict": eval_res["region_verdict"],
+                "optional_profile_verdict": eval_res["optional_profile_verdict"],
+                "matched_eligibility_phrases": eval_res["matched_eligibility_phrases"],
             }
             doc_copy["rag_score"] = s_score
             results.append(doc_copy)
@@ -196,7 +228,7 @@ class MCPServerRegistry:
         },
         {
             "name": "mcp_kstartup_rag_search",
-            "description": "인덱싱된 '모집중' 공고에서 창업자 프로필과 질의에 부합하는 공고 및 정량적 매칭 근거를 검색합니다.",
+            "description": "인덱싱된 '모집중' 공고에서 하드 필터링(업력·지역·선택프로필 적격 검증)을 통과한 공고 및 정량적 매칭 근거를 검색하고 배제된 결격 공고 메타데이터를 분리 반환합니다.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -205,18 +237,34 @@ class MCPServerRegistry:
                     "user_region": {"type": "string"},
                     "category_filter": {"type": "string", "default": "전체"},
                     "top_k": {"type": "integer", "default": 3},
+                    "optional_profile": {
+                        "type": "object",
+                        "properties": {
+                            "age_group": {"type": "string"},
+                            "business_type": {"type": "string"},
+                            "exact_career": {"type": "string"},
+                        },
+                    },
                 },
                 "required": ["query"],
             },
         },
         {
             "name": "mcp_analyze_startup_eligibility",
-            "description": "3대 페르소나 적격 판단 기준에 따라 후보 공고의 지원대상·주관지역·마감일과 사용자 프로필을 교차 검증합니다.",
+            "description": "3대 페르소나 적격 판단 기준 및 선택 프로필에 따라 후보 공고의 지원대상·주관지역·연령·사업자형태·업력과 사용자 프로필을 교차 검증하고 매칭 근거 문구를 추출합니다.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "user_stage": {"type": "string"},
                     "user_region": {"type": "string"},
+                    "optional_profile": {
+                        "type": "object",
+                        "properties": {
+                            "age_group": {"type": "string"},
+                            "business_type": {"type": "string"},
+                            "exact_career": {"type": "string"},
+                        },
+                    },
                     "candidates": {"type": "array", "items": {"type": "object"}},
                 },
             },
@@ -266,6 +314,19 @@ class MCPServerRegistry:
         graph_stats = self.graph_engine.build_knowledge_graph(data)
         return indexed_count, graph_stats, status
 
+    @staticmethod
+    def _extract_optional_profile(arguments: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        opt = arguments.get("optional_profile")
+        if isinstance(opt, dict):
+            return opt
+        if any(k in arguments for k in ("age_group", "business_type", "exact_career")):
+            return {
+                "age_group": str(arguments.get("age_group", "선택 안 함")),
+                "business_type": str(arguments.get("business_type", "선택 안 함")),
+                "exact_career": str(arguments.get("exact_career", "")),
+            }
+        return None
+
     def list_tools(self) -> List[Dict[str, Any]]:
         return list(self._MCP_TOOLS_SCHEMA)
 
@@ -288,6 +349,7 @@ class MCPServerRegistry:
             user_region = arguments.get("user_region", "")
             category_filter = arguments.get("category_filter", "전체")
             top_k = arguments.get("top_k", 3)
+            optional_profile = self._extract_optional_profile(arguments)
 
             if not self.rag_engine.is_indexed:
                 self._load_and_index_all()
@@ -298,7 +360,9 @@ class MCPServerRegistry:
                 user_region=user_region,
                 category_filter=category_filter,
                 top_k=top_k,
+                optional_profile=optional_profile,
             )
+            excluded = list(self.rag_engine.last_excluded_announcements)
             return {
                 "protocol": "MCP/1.0",
                 "tool": tool_name,
@@ -307,12 +371,15 @@ class MCPServerRegistry:
                 "category_filter_used": category_filter,
                 "results_count": len(matched),
                 "matched_announcements": matched,
+                "excluded_count": len(excluded),
+                "excluded_announcements": excluded,
             }
 
         elif tool_name == "mcp_analyze_startup_eligibility":
             user_stage = arguments.get("user_stage", "예비창업자")
             user_region = arguments.get("user_region", "서울")
             candidates = arguments.get("candidates", [])
+            optional_profile = self._extract_optional_profile(arguments)
             persona_label = StartupTaxonomyGraphEngine.map_stage_to_persona(user_stage)
             persona_criteria = StartupTaxonomyGraphEngine.get_persona_criteria_info(persona_label)
 
@@ -322,16 +389,27 @@ class MCPServerRegistry:
                     persona_label=persona_label,
                     user_region=user_region,
                     ann=c,
+                    optional_profile=optional_profile,
                 )
                 audit_results.append(
                     {
                         "pbanc_sn": c.get("pbanc_sn"),
                         "title": c.get("title"),
                         "target_stage": c.get("target_stage", ""),
+                        "region": c.get("region", ""),
                         "persona_applied": persona_label,
                         "criteria_basis": eval_res["criteria_basis"],
+                        "is_eligible": eval_res["is_eligible"],
                         "stage_verdict": eval_res["stage_verdict"],
                         "region_verdict": eval_res["region_verdict"],
+                        "optional_profile_verdict": eval_res["optional_profile_verdict"],
+                        "matched_eligibility_phrases": eval_res[
+                            "matched_eligibility_phrases"
+                        ],
+                        "disqualification_reasons": eval_res["disqualification_reasons"],
+                        "matched_disqualification_phrases": eval_res[
+                            "matched_disqualification_phrases"
+                        ],
                         "d_day": c.get("d_day"),
                         "deadline": c.get("deadline"),
                         "key_benefit": c.get("summary", ""),
